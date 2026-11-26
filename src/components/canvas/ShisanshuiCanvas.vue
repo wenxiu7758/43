@@ -2216,7 +2216,7 @@ function handleReconnectSync(msg: any) {
     updateLabels();
   }
 
-  if (bs?.phase === 'ended' && bs?.shisanshuiSettlement && !hasCompared.value) {
+  if (isServerEnded && bs?.shisanshuiSettlement && !hasCompared.value) {
     executeShowdown(bs.shisanshuiSettlement);
     hasClickedReady.value = matchedSelfReady;
     return;

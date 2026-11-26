@@ -254,16 +254,17 @@ function getReconnectStamp(msg: any): string {
   return `${rId}:${msg.serverTs || 0}:${msg.boardState?.actionSeq ?? ''}:${msg.room?.status || ''}`;
 }
 
-function applyReconnectSnapshotIfMatching(snap: any) {
-  if (!snap || snap.failed || props.isPracticeMode) return;
+function applyReconnectSnapshotIfMatching(snap: any): boolean {
+  if (!snap || snap.failed || props.isPracticeMode) return false;
   const snapRoomId = snap.room?.id || snap.roomId;
-  if (!snapRoomId || !props.roomId || snapRoomId !== props.roomId) return;
+  if (!snapRoomId || !props.roomId || snapRoomId !== props.roomId) return false;
   const stamp = getReconnectStamp(snap);
-  if (stamp && lastAppliedReconnectStamp === stamp) return;
+  if (stamp && lastAppliedReconnectStamp === stamp) return true;
   lastAppliedReconnectStamp = stamp;
   lastProcessedMoveCount = -1;
   lastProcessedMoveKey = '';
   handleReconnectSync(snap);
+  return true;
 }
 
 const autoManagedSeats = ref<Record<number, boolean>>({});
@@ -298,7 +299,8 @@ const mySeat = computed(() => {
 const getSeatName = (seat: number) => {
   if (props.roomPlayers && props.roomPlayers.length > 0) {
     const absSeat = (mySeat.value + seat) % 4;
-    const p = props.roomPlayers.find((x: any) => x.seat === absSeat) || props.roomPlayers[absSeat];
+    const hasExplicitSeats = props.roomPlayers.some((x: any) => typeof x?.seat === 'number');
+    const p = props.roomPlayers.find((x: any) => x?.seat === absSeat) || (!hasExplicitSeats ? props.roomPlayers[absSeat] : undefined);
     if (p) {
       const prefix = seat === 0 ? '本家' : seat === 1 ? '东席' : seat === 2 ? '北席' : '西席';
       const isDisc = Boolean(p.isDisconnected || disconnectedSeats.value[absSeat]);
@@ -330,12 +332,14 @@ const emit = defineEmits<{
 
 function isSeatAutoManaged(absSeat: number): boolean {
   if (absSeat === mySeat.value) return isAutoHost.value;
-  const p = props.roomPlayers?.find((x: any) => x.seat === absSeat) || props.roomPlayers?.[absSeat];
+  const hasExplicitSeats = Boolean(props.roomPlayers?.some((x: any) => typeof x?.seat === 'number'));
+  const p = props.roomPlayers?.find((x: any) => x?.seat === absSeat) || (!hasExplicitSeats ? props.roomPlayers?.[absSeat] : undefined);
   return Boolean(p?.isAutoManaged || p?.isDisconnected || autoManagedSeats.value[absSeat] || disconnectedSeats.value[absSeat]);
 }
 
 function isSeatDisconnected(absSeat: number): boolean {
-  const p = props.roomPlayers?.find((x: any) => x.seat === absSeat) || props.roomPlayers?.[absSeat];
+  const hasExplicitSeats = Boolean(props.roomPlayers?.some((x: any) => typeof x?.seat === 'number'));
+  const p = props.roomPlayers?.find((x: any) => x?.seat === absSeat) || (!hasExplicitSeats ? props.roomPlayers?.[absSeat] : undefined);
   return Boolean(p?.isDisconnected || disconnectedSeats.value[absSeat]);
 }
 
@@ -389,6 +393,13 @@ watch(() => props.tableTheme, () => {
 watch(() => props.initialDeal, (deal) => {
   if (props.isPracticeMode || !deal?.seatCards) return;
   const dealIdentifier = deal.dealId || deal.createdAt || (Array.isArray(deal.seatCards[0]) ? deal.seatCards[0].map((c: any) => c.id || c.name).join('-') : '');
+  const recon = props.reconnectSnapshot;
+  const reconMatchesRoom = Boolean(recon && !recon.failed && (recon.room?.id || recon.roomId) === props.roomId);
+  const reconDealId = recon?.deal?.dealId || recon?.deal?.createdAt || '';
+  const isReconEnded = Boolean(reconMatchesRoom && (recon?.room?.status === 'finished' || recon?.boardState?.phase === 'ended'));
+  if (isReconEnded && (!dealIdentifier || !reconDealId || reconDealId === dealIdentifier)) {
+    return;
+  }
   if (lastAppliedDealId.value && lastAppliedDealId.value === dealIdentifier) {
     if (hasWon.value || showSettlement.value || isDrawStalemate.value || dealingPhase.value === 'settled' || (myHand.value && myHand.value.length > 0)) {
       console.log('🛡️ [麻将防重置] 发牌标识一致，保持当前牌桌或结算界面');
@@ -1033,10 +1044,12 @@ const winningBreakdown = ref<WinningBreakdown>({
 
 const settledWinnerLabel = computed(() => {
   const wSeat = winningBreakdown.value.winnerSeat ?? (lastWinnerSeat.value ?? dealerSeat.value);
-  if (props.roomPlayers && props.roomPlayers.length > 0) {
+  const absW = relToAbsSeat(wSeat);
+  const matchedWinner = props.roomPlayers?.find((p: any) => p && typeof p.seat === 'number' && p.seat === absW);
+  if (matchedWinner) {
     return getSeatName(wSeat);
   }
-  return winningBreakdown.value.winnerNameSnapshot || SEAT_NAMES[wSeat] || '牌友';
+  return winningBreakdown.value.winnerNameSnapshot || getSeatName(wSeat) || SEAT_NAMES[wSeat] || '牌友';
 });
 
 const settledWinningMelds = computed<MahjongTile[][]>(() => {
@@ -1252,10 +1265,14 @@ function tryRestoreLocalSnapshot(): boolean {
     oppHandsDealtCount.value = [oppCounts.value[0], oppCounts.value[1], oppCounts.value[2]];
     handFlipProgress.value = 1;
 
-    if (snap.isSettled) {
+    if (snap.isSettled && (snap.hasWon || snap.isDrawStalemate)) {
+      if (!snap.hasClickedReady && snap.settlementExpiresAt && Date.now() >= Number(snap.settlementExpiresAt) + 1500) {
+        clearLocalSnapshot();
+        return false;
+      }
       dealingPhase.value = 'settled';
       hasWon.value = Boolean(snap.hasWon);
-      showSettlement.value = Boolean(snap.showSettlement);
+      showSettlement.value = Boolean(snap.showSettlement || snap.hasWon);
       isDrawStalemate.value = Boolean(snap.isDrawStalemate);
       lastWinnerSeat.value = snap.lastWinnerSeat ?? null;
       hasClickedReady.value = Boolean(snap.hasClickedReady);
@@ -1326,9 +1343,7 @@ function handleReconnectSync(msg: any) {
     }
   }
 
-  if (isServerEnded) {
-    dealingPhase.value = 'settled';
-  } else if (bs?.phase && bs.phase !== 'ended') {
+  if (!isServerEnded && bs?.phase && bs.phase !== 'ended') {
     stopSettlementCountdown();
     hasWon.value = false;
     showSettlement.value = false;
@@ -1446,29 +1461,53 @@ function handleReconnectSync(msg: any) {
   oppHandsDealtCount.value = [oppCounts.value[0], oppCounts.value[1], oppCounts.value[2]];
 
   const resolvedExpiresAt = msg.settlementExpiresAt || bs?.settlement?.settlementExpiresAt || null;
+  const refNowTs = Number(msg.serverTs || Date.now());
+  if (isServerEnded && resolvedExpiresAt && refNowTs >= Number(resolvedExpiresAt) + 1500 && !hasClickedReady.value) {
+    handleLeaveToLobby();
+    return;
+  }
 
-  if (bs?.phase === 'ended' && bs?.isDraw) {
+  const stlObj = bs?.settlement || {};
+  const isSettledDraw = Boolean(bs?.isDraw || stlObj.isDraw);
+  const resolvedWinnerSeat = bs?.winnerSeat !== null && bs?.winnerSeat !== undefined ? bs.winnerSeat : stlObj.winnerSeat;
+
+  if (isServerEnded && isSettledDraw) {
     if (isDrawStalemate.value) {
-      if (Array.isArray(bs?.settlement?.netCoinsPerSeat) && bs.settlement.netCoinsPerSeat.length === 4) {
-        stalemateNetCoins.value = [0, 1, 2, 3].map((relS) => bs.settlement.netCoinsPerSeat[relToAbsSeat(relS)] || 0);
+      dealingPhase.value = 'settled';
+      if (Array.isArray(stlObj.netCoinsPerSeat) && stlObj.netCoinsPerSeat.length === 4) {
+        stalemateNetCoins.value = [0, 1, 2, 3].map((relS) => stlObj.netCoinsPerSeat[relToAbsSeat(relS)] || 0);
       }
       startSettlementCountdown(resolvedExpiresAt, msg.serverTs);
       saveLocalSnapshotNow();
+      drawTable();
       return;
     }
-    triggerDrawStalemate(bs?.settlement?.message || '牌墙抓毕，本局荒庄（流局）！', true, {
-      ...(bs.settlement || {}),
+    hasWon.value = false;
+    showSettlement.value = false;
+    isDrawStalemate.value = false;
+    dealingPhase.value = 'playing';
+    triggerDrawStalemate(stlObj.message || '牌墙抓毕，本局荒庄（流局）！', true, {
+      ...stlObj,
       settlementExpiresAt: resolvedExpiresAt,
       serverTs: msg.serverTs,
     });
     return;
   }
 
-  if (bs?.phase === 'ended' && bs?.winnerSeat !== null && bs?.winnerSeat !== undefined) {
-    const stlObj = bs.settlement || {};
-    const relWinner = absToRelSeat(bs.winnerSeat);
-    if (hasWon.value && showSettlement.value) {
+  if (isServerEnded && resolvedWinnerSeat !== null && resolvedWinnerSeat !== undefined) {
+    const relWinner = absToRelSeat(resolvedWinnerSeat);
+    const wPrefix = relWinner === 0 ? '本家' : relWinner === 1 ? '东席' : relWinner === 2 ? '北席' : '西席';
+    const winnerInRoom = Array.isArray(props.roomPlayers)
+      ? props.roomPlayers.find((p: any) => p && typeof p.seat === 'number' && p.seat === resolvedWinnerSeat)
+      : undefined;
+    const authWinnerName = stlObj.winnerName
+      ? `${wPrefix} (${stlObj.winnerName})`
+      : (winnerInRoom ? getSeatName(relWinner) : (winningBreakdown.value.winnerNameSnapshot || SEAT_NAMES[relWinner]));
+
+    if (hasWon.value && (showSettlement.value || dealingPhase.value === 'settled') && winningBreakdown.value.winnerSeat === relWinner) {
       // 已被本地快照抢先恢复，补充权威数据与服务器倒计时
+      showSettlement.value = true;
+      dealingPhase.value = 'settled';
       if (Array.isArray(stlObj.winningHand) && stlObj.winningHand.length > 0) {
         const cleanAuthHand = sortHand(stlObj.winningHand.filter((t: any) => t && !t.hidden));
         if (cleanAuthHand.length > 0) {
@@ -1483,18 +1522,36 @@ function handleReconnectSync(msg: any) {
         if (relWinner === 0) meldedTiles.value = normAuthMelds;
         else oppMelds.value[relWinner - 1] = normAuthMelds;
       }
+      if (Array.isArray(stlObj.maTiles) && stlObj.maTiles.length > 0) {
+        winningBreakdown.value.rewardMaTiles = stlObj.maTiles;
+        winningBreakdown.value.maCount = stlObj.maCount || stlObj.maTiles.length;
+      }
+      if (typeof stlObj.hitMaCount === 'number') {
+        winningBreakdown.value.hitMaCount = stlObj.hitMaCount;
+        winningBreakdown.value.totalFan = 1 + stlObj.hitMaCount;
+      }
+      if (typeof stlObj.payoutPerOpponent === 'number') {
+        winningBreakdown.value.payoutPerOpponent = stlObj.payoutPerOpponent;
+      }
+      if (typeof stlObj.isFourHongzhong === 'boolean' || typeof stlObj.isFourHz === 'boolean') {
+        winningBreakdown.value.isFourHongzhong = Boolean(stlObj.isFourHongzhong || stlObj.isFourHz);
+      }
       if (Array.isArray(stlObj.netCoinsPerSeat) && stlObj.netCoinsPerSeat.length === 4) {
         const syncedNet = [0, 1, 2, 3].map((relS) => stlObj.netCoinsPerSeat[relToAbsSeat(relS)] || 0);
         winningBreakdown.value.netCoinsPerSeat = syncedNet;
         winningBreakdown.value.rewardCoins = syncedNet[0];
       }
       winningBreakdown.value.winnerSeat = relWinner;
-      winningBreakdown.value.winnerNameSnapshot = SEAT_NAMES[relWinner];
+      winningBreakdown.value.winnerNameSnapshot = authWinnerName;
       startSettlementCountdown(resolvedExpiresAt, msg.serverTs);
       saveLocalSnapshotNow();
       drawTable();
       return;
     }
+    hasWon.value = false;
+    showSettlement.value = false;
+    isDrawStalemate.value = false;
+    dealingPhase.value = 'playing';
     triggerMahjongWin(relWinner, Boolean(stlObj.isFourHongzhong || stlObj.isFourHz), {
       ...stlObj,
       winningHand: stlObj.winningHand,
@@ -1502,6 +1559,19 @@ function handleReconnectSync(msg: any) {
       settlementExpiresAt: resolvedExpiresAt,
       serverTs: msg.serverTs,
       fromServerWs: true,
+    });
+    return;
+  }
+
+  if (isServerEnded) {
+    hasWon.value = false;
+    showSettlement.value = false;
+    isDrawStalemate.value = false;
+    dealingPhase.value = 'playing';
+    triggerDrawStalemate(stlObj.message || '本局游戏已结束！', true, {
+      ...stlObj,
+      settlementExpiresAt: resolvedExpiresAt,
+      serverTs: msg.serverTs,
     });
     return;
   }
@@ -2118,7 +2188,14 @@ function triggerMahjongWin(winnerSeat: number, isFourHongzhong = false, payloadD
   hasWon.value = true;
   showSettlement.value = true;
   dealingPhase.value = 'settled';
-  const winnerName = SEAT_NAMES[winnerSeat] || ['您 (本席)', '东席 (牌友)', '北席 (牌友)', '西席 (牌友)'][winnerSeat] || '雀圣';
+  const absWSeat = relToAbsSeat(winnerSeat);
+  const wPrefix = winnerSeat === 0 ? '本家' : winnerSeat === 1 ? '东席' : winnerSeat === 2 ? '北席' : '西席';
+  const winnerStillInRoom = Array.isArray(props.roomPlayers)
+    ? props.roomPlayers.find((p: any) => p && typeof p.seat === 'number' && p.seat === absWSeat)
+    : undefined;
+  const winnerName = winnerStillInRoom
+    ? SEAT_NAMES[winnerSeat]
+    : (payloadData?.winnerName ? `${wPrefix} (${payloadData.winnerName})` : (SEAT_NAMES[winnerSeat] || ['您 (本席)', '东席 (牌友)', '北席 (牌友)', '西席 (牌友)'][winnerSeat] || '雀圣'));
 
   if (serverUnmaskedHand.length > 0 || !isPlayer) {
     if (isPlayer) {
@@ -3596,6 +3673,12 @@ function onWsMessage(ev: MessageEvent) {
       lastProcessedMoveKey = '';
       handleReconnectSync(msg);
     } else if (msg.type === 'scene_join_ack' || msg.type === 'scene_room_full' || msg.type === 'scene_room_started') {
+      if (msg.status === 'finished' || msg.room?.status === 'finished' || msg.boardState?.phase === 'ended') {
+        lastProcessedMoveCount = -1;
+        lastProcessedMoveKey = '';
+        handleReconnectSync(msg);
+        return;
+      }
       if (msg.deal) {
         const dealIdentifier = msg.deal.dealId || msg.deal.createdAt || '';
         if (dealIdentifier && dealIdentifier === lastAppliedDealId.value && (dealingPhase.value === 'playing' || dealingPhase.value === 'settled')) {
@@ -4139,15 +4222,17 @@ onMounted(() => {
   if (props.ws) {
     props.ws.addEventListener('message', onWsMessage);
   }
-  const restored = tryRestoreLocalSnapshot();
-  if (!restored) {
-    if (props.initialDeal?.seatCards) {
-      dealNewMatch(undefined, false, props.initialDeal);
-    } else {
-      dealNewMatch();
+  const appliedRecon = applyReconnectSnapshotIfMatching(props.reconnectSnapshot);
+  if (!appliedRecon) {
+    const restored = tryRestoreLocalSnapshot();
+    if (!restored) {
+      if (props.initialDeal?.seatCards) {
+        dealNewMatch(undefined, false, props.initialDeal);
+      } else {
+        dealNewMatch();
+      }
     }
   }
-  applyReconnectSnapshotIfMatching(props.reconnectSnapshot);
   updateDimensions();
   window.addEventListener('resize', updateDimensions);
   if (containerRef.value && typeof ResizeObserver !== 'undefined') {

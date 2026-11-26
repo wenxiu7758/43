@@ -1130,7 +1130,7 @@ function runServerEngineRegressionTests() {
     status: 'playing',
     moveCount: 4,
     turnSeat: 0,
-    players: [{ id: 'm0', seat: 0 }, { id: 'm1', seat: 1 }, { id: 'm2', seat: 2 }, { id: 'm3', seat: 3 }],
+    players: [{ id: 'm0', seat: 0, name: '胡牌雀圣' }, { id: 'm1', seat: 1, name: '乙' }, { id: 'm2', seat: 2, name: '丙' }, { id: 'm3', seat: 3, name: '丁' }],
     deal: {
       seatCards: [mjWinHand14, [], [], []],
       remainingWall: Array.from({ length: 10 }, (_, i) => mjTile('wan', 2, `miss-wall-${i}`)),
@@ -1150,6 +1150,7 @@ function runServerEngineRegressionTests() {
   const forgedMaTiles = Array.from({ length: 8 }, (_, i) => mjTile('wan', 1, `forged-${i}`));
   executeMahjongWinSettlement(mockCtx, forgedWallRoom, 0, false, { maTiles: forgedMaTiles });
   assert.equal(forgedWallRoom.boardState.settlement.hitMaCount, 0, 'Server settlement must draw Ma from remainingWall and ignore client forged maTiles');
+  assert.equal(forgedWallRoom.boardState.settlement.winnerName, '胡牌雀圣', 'Server settlement must persist winnerName snapshot for remaining players after winner leaves');
 
   // 8. Mahjong Server Engine: plain-object seatCards must open claimWindow, block draw/discard while open, and allow Peng cleanly
   const pengTarget = mjTile('wan', 5, 'd1');

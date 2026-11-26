@@ -100,10 +100,16 @@ export function executeMahjongWinSettlement(
     undefined
   );
 
+  const winnerPlayerObj = Array.isArray(room.players)
+    ? room.players.find((pl: any) => pl && pl.seat === winnerSeat)
+    : null;
+  const winnerName = winnerPlayerObj?.name || '';
+
   room.boardState.winDesc = stl.isFourHongzhong ? '摸到四张红中直接胡牌' : '自摸和牌';
   room.boardState.settlement = {
     ...stl,
     winnerSeat,
+    winnerName,
     isFourHz: stl.isFourHongzhong,
     kongHistory: resolvedKongHistory,
     settlementExpiresAt,
@@ -120,6 +126,7 @@ export function executeMahjongWinSettlement(
     seat: winnerSeat,
     absSeat: winnerSeat,
     winner: winnerSeat,
+    winnerName,
     isFourHz: stl.isFourHongzhong,
     winningHand: stl.winningHand,
     winningMelds: stl.winningMelds,

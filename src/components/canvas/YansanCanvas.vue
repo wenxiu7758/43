@@ -1851,7 +1851,8 @@ function handleReconnectSync(msg: any) {
   drawTable();
   saveLocalSnapshot();
   emitStatus();
-  if (winnerSeat.value === null) {
+  const isFinishedRoom = Boolean(msg.room?.status === 'finished' || bs?.phase === 'ended');
+  if (winnerSeat.value === null && !isFinishedRoom) {
     startTurnCountdown();
     if (turnSeat.value === mySeat.value) {
       if (isAutoHost.value) {

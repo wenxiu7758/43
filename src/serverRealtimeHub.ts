@@ -945,9 +945,83 @@ export function createRealtimeHub(wss: WebSocketServer): (payload: unknown) => v
                 }
               }
               const authRoom = rooms.get(targetRoom.id);
-              const isFinishedPhase = targetRoom.status === 'finished' || authRoom?.boardState?.phase === 'ended';
+              const isFinishedPhase =
+                targetRoom.status === 'finished' ||
+                authRoom?.boardState?.phase === 'ended' ||
+                authRoom?.status === 'finished';
+              const settlementExpiresAt =
+                (authRoom as any)?.settlementExpiresAt ||
+                (targetRoom as any)?.settlementExpiresAt ||
+                authRoom?.boardState?.settlement?.settlementExpiresAt ||
+                null;
+              const nowTs = Date.now();
+
+              if (isFinishedPhase && settlementExpiresAt && nowTs >= settlementExpiresAt) {
+                if (!pl.isReady) {
+                  targetRoom.players = targetRoom.players.filter((x) => x !== pl);
+                  if (authRoom?.players) {
+                    authRoom.players = authRoom.players.filter((x: any) => x.id !== pl.id);
+                  }
+                  if (targetRoom.players.length === 0) {
+                    sceneWaitingRooms.delete(targetRoom.id);
+                    rooms.delete(targetRoom.id);
+                  }
+                  scheduleActiveRoomsSnapshot();
+                  ws.send(JSON.stringify({ type: 'scene_reconnect_ack', failed: true, reason: 'settlement_expired' }));
+                  return;
+                }
+                const readyPlayers = targetRoom.players
+                  .filter((p: any) => !isBotLikePlayer(p) && p.isReady)
+                  .map((p: any, idx: number) => ({
+                    ...p,
+                    seat: idx,
+                    isReady: true,
+                  }));
+                targetRoom.players = readyPlayers;
+                targetRoom.status = 'waiting';
+                delete (targetRoom as any).deal;
+                delete (targetRoom as any).settlementExpiresAt;
+                if (authRoom) {
+                  authRoom.players = readyPlayers.map((p: any) => ({ ...p }));
+                  authRoom.status = 'waiting';
+                  authRoom.moveCount = 0;
+                  authRoom.turnSeat = 0;
+                  delete authRoom.deal;
+                  delete authRoom.settlementExpiresAt;
+                  delete authRoom.lastTurnTs;
+                  delete authRoom._coinsSettledRoundKey;
+                  authRoom.boardState = createDefaultBoardState(authRoom.id, authRoom.gameType);
+                }
+                const recycledSelf = targetRoom.players.find((p) => p.id === pl.id) || pl;
+                delete (recycledSelf as any).isDisconnected;
+                delete (recycledSelf as any).isAutoManaged;
+                (recycledSelf as any).socketId = (ws as any).socketId;
+                (ws as any).sceneRoomId = targetRoom.id;
+                (ws as any).scenePlayerId = recycledSelf.id;
+                const { deal: _rawWaitDeal, _startTimer: _wt, ...safeWaitRoom } = targetRoom as any;
+                ws.send(
+                  JSON.stringify({
+                    type: 'scene_reconnect_ack',
+                    room: safeWaitRoom,
+                    boardState: null,
+                    players: targetRoom.players,
+                    deal: null,
+                    settlementExpiresAt: null,
+                    serverTs: nowTs,
+                  })
+                );
+                scheduleActiveRoomsSnapshot();
+                return;
+              }
+
               if (isFinishedPhase) {
                 targetRoom.status = 'finished';
+                if (authRoom) {
+                  authRoom.status = 'finished';
+                  if (authRoom.boardState && authRoom.boardState.phase !== 'ended') {
+                    authRoom.boardState.phase = 'ended';
+                  }
+                }
               }
               delete (pl as any).isDisconnected;
               if (!isFinishedPhase) {
@@ -972,12 +1046,6 @@ export function createRealtimeHub(wss: WebSocketServer): (payload: unknown) => v
                 }
               }
               const rawDeal = (authRoom ? (authRoom as any).deal : null) || (targetRoom as any).deal || null;
-              const settlementExpiresAt =
-                (authRoom as any)?.settlementExpiresAt ||
-                (targetRoom as any)?.settlementExpiresAt ||
-                authRoom?.boardState?.settlement?.settlementExpiresAt ||
-                null;
-              const nowTs = Date.now();
               const { deal: _rawRoomDeal, _startTimer: _st, ...safeRoom } = targetRoom as any;
               ws.send(
                 JSON.stringify({

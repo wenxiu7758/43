@@ -569,13 +569,214 @@ async function main() {
   );
   assert.equal(midGameAutoHostEvt.boardState?.autoManagedSeats?.[switchSeat], true, 'Mid-game scene switch must sync autoManagedSeats to active room');
 
+  // 4. Mahjong 4-player E2E: offline player misses end-of-game -> 3 players leave -> 4th player reconnects directly to ended settlement
+  const mjEndClients = await Promise.all([
+    connectClient(wsUrl),
+    connectClient(wsUrl),
+    connectClient(wsUrl),
+    connectClient(wsUrl),
+  ]);
+  await Promise.all(mjEndClients.map((c) => c.waitFor((m) => m.type === 'lobby_snapshot', 3000, 'mjEnd lobby_snapshot')));
+
+  mjEndClients.forEach((c, idx) => {
+    c.ws.send(
+      JSON.stringify({
+        type: 'scene_join',
+        gameType: 'mahjong',
+        sceneMode: 'hongzhong-6',
+        sceneName: '红中6码场',
+        maxPlayers: 4,
+        player: {
+          id: `e2e-mjend-${idx}`,
+          name: `结算重连测试${idx}`,
+          avatar: '🀄',
+          rating: 1800,
+          coins: 3000,
+          seat: idx,
+        },
+      })
+    );
+  });
+
+  const mjEndFullMsgs = await Promise.all(
+    mjEndClients.map((c, idx) => c.waitFor((m) => m.type === 'scene_room_full', 4000, `mjEnd-${idx} scene_room_full`))
+  );
+  const mjEndRoomId = mjEndFullMsgs[0].roomId;
+  await Promise.all(
+    mjEndClients.map((c, idx) => c.waitFor((m) => m.type === 'scene_room_started', 4000, `mjEnd-${idx} scene_room_started`))
+  );
+
+  // Track seat->client mapping & own hands
+  const seatClientMap = new Map<number, { client: TestClient; playerId: string; playerName: string; hand: any[] }>();
+  mjEndFullMsgs.forEach((m, idx) => {
+    seatClientMap.set(m.assignedSeat, {
+      client: mjEndClients[idx],
+      playerId: m.assignedPlayerId,
+      playerName: `结算重连测试${idx}`,
+      hand: [...m.deal.seatCards[m.assignedSeat]],
+    });
+  });
+
+  // Step through turns rapidly via draw/pass/discard until wall exhausts (draw_stalemate) or 4-HZ hu;
+  // disconnect seat 3 right when wallRemaining hits 1 so seat 3 misses the end event offline!
+  let curSeat = mjEndFullMsgs[0].turnSeat ?? 0;
+  let curWall = (mjEndFullMsgs[0].deal?.remainingWall || []).length;
+  let gameEndedEvt: any = null;
+  let offlineSeat = 3;
+  let offlineDisconnected = false;
+
+  for (let step = 0; step < 260 && !gameEndedEvt; step++) {
+    const active = seatClientMap.get(curSeat)!;
+    const anyOnline = seatClientMap.get(curSeat === offlineSeat && offlineDisconnected ? (curSeat + 1) % 4 : curSeat)!;
+
+    if (active.hand.length % 3 === 1) {
+      const prevLen = anyOnline.client.messages.length;
+      const prevActiveLen = active.client.messages.length;
+      active.client.ws.send(JSON.stringify({ type: 'game_move', roomId: mjEndRoomId, seat: curSeat, event: { action: 'draw', seat: curSeat } }));
+      const evtMsg = await anyOnline.client.waitFor(
+        (m) =>
+          anyOnline.client.messages.indexOf(m) >= prevLen &&
+          m.type === 'game_event' &&
+          (m.event?.action === 'draw' || m.event?.action === 'draw_stalemate' || m.event?.action === 'hu'),
+        3000,
+        `mjEnd step ${step} draw`
+      );
+      if (evtMsg.event.action === 'draw_stalemate' || evtMsg.event.action === 'hu') {
+        gameEndedEvt = evtMsg;
+        break;
+      }
+      // If active seat drew, get exact tile from active's own draw event
+      const selfDrawMsg = await active.client.waitFor(
+        (m) =>
+          active.client.messages.indexOf(m) >= prevActiveLen &&
+          m.type === 'game_event' &&
+          m.event?.action === 'draw' &&
+          m.event?.seat === curSeat &&
+          m.event?.tile &&
+          !m.event.tile.hidden,
+        3000,
+        `mjEnd step ${step} self draw`
+      );
+      active.hand.push(selfDrawMsg.event.tile);
+      if (typeof selfDrawMsg.event.wallRemaining === 'number') {
+        curWall = selfDrawMsg.event.wallRemaining;
+      }
+    }
+
+    // Disconnect an opponent seat once wall is empty right before curSeat discards (which triggers draw_stalemate!)
+    if (!offlineDisconnected && curWall === 0) {
+      offlineSeat = (curSeat + 1) % 4;
+      offlineDisconnected = true;
+      seatClientMap.get(offlineSeat)!.client.ws.close();
+      await new Promise((r) => setTimeout(r, 80));
+    }
+
+    // Discard one tile
+    const discardTile = active.hand.shift()!;
+    const prevDiscLen = anyOnline.client.messages.length;
+    active.client.ws.send(
+      JSON.stringify({
+        type: 'game_move',
+        roomId: mjEndRoomId,
+        seat: curSeat,
+        event: { action: 'discard', seat: curSeat, tile: discardTile },
+      })
+    );
+    const discMsg = await anyOnline.client.waitFor(
+      (m) => anyOnline.client.messages.indexOf(m) >= prevDiscLen && m.type === 'game_event' && m.event?.action === 'discard',
+      3000,
+      `mjEnd step ${step} discard`
+    );
+
+    if (discMsg.event?.hasClaimWindow) {
+      const pendingSeats: number[] = discMsg.boardState?.extraState?.claimWindow?.pendingSeats || [];
+      for (const ps of pendingSeats) {
+        if (ps === offlineSeat && offlineDisconnected) continue;
+        seatClientMap.get(ps)!.client.ws.send(
+          JSON.stringify({
+            type: 'game_move',
+            roomId: mjEndRoomId,
+            seat: ps,
+            event: { action: 'pass', seat: ps },
+          })
+        );
+      }
+    }
+
+    const resMsg = await anyOnline.client.waitFor(
+      (m) =>
+        anyOnline.client.messages.indexOf(m) >= prevDiscLen &&
+        m.type === 'game_event' &&
+        (m.event?.action === 'claim_resolved' || m.event?.action === 'draw_stalemate' || m.event?.action === 'hu'),
+      4000,
+      `mjEnd step ${step} post-discard resolution`
+    );
+    if (resMsg.event.action === 'draw_stalemate' || resMsg.event.action === 'hu') {
+      gameEndedEvt = resMsg;
+      break;
+    }
+    curSeat = resMsg.event?.nextTurn ?? discMsg.event?.nextTurn ?? ((curSeat + 1) % 4);
+  }
+
+  assert(gameEndedEvt, 'Mahjong E2E match must reach ended state');
+  assert.equal(gameEndedEvt.boardState?.phase, 'ended', 'Game-end event must set boardState.phase to ended');
+
+  // If offlineSeat was still connected (e.g. instant 4-HZ hu), close it before reconnect
+  if (!offlineDisconnected) {
+    seatClientMap.get(offlineSeat)!.client.ws.close();
+    await new Promise((r) => setTimeout(r, 80));
+  }
+
+  // Remaining 3 players return to lobby via scene_leave
+  for (let s = 0; s < 4; s++) {
+    if (s === offlineSeat) continue;
+    const entry = seatClientMap.get(s)!;
+    entry.client.ws.send(
+      JSON.stringify({
+        type: 'scene_leave',
+        roomId: mjEndRoomId,
+        playerId: entry.playerId,
+        playerName: entry.playerName,
+        gameType: 'mahjong',
+        sceneMode: 'hongzhong-6',
+      })
+    );
+  }
+  await new Promise((r) => setTimeout(r, 100));
+
+  // Offline 4th player refreshes & sends scene_reconnect -> MUST receive ended settlement state, NEVER playing status
+  const offlineEntry = seatClientMap.get(offlineSeat)!;
+  const mjEndReconClient = await connectClient(wsUrl);
+  await mjEndReconClient.waitFor((m) => m.type === 'lobby_snapshot', 3000, 'mjEndRecon lobby_snapshot');
+  mjEndReconClient.ws.send(
+    JSON.stringify({
+      type: 'scene_reconnect',
+      roomId: mjEndRoomId,
+      playerId: offlineEntry.playerId,
+      playerName: offlineEntry.playerName,
+    })
+  );
+  const mjEndReconAck = await mjEndReconClient.waitFor(
+    (m) => m.type === 'scene_reconnect_ack',
+    3000,
+    'mjEndRecon scene_reconnect_ack'
+  );
+  assert(!mjEndReconAck.failed, 'Offline 4th player must recover settlement state before timeout');
+  assert.equal(mjEndReconAck.room?.status, 'finished', 'Reconnected ended Mahjong room must report status finished');
+  assert.equal(mjEndReconAck.boardState?.phase, 'ended', 'Reconnected ended Mahjong boardState must report phase ended');
+  assert(mjEndReconAck.boardState?.settlement, 'Reconnected ended Mahjong must include authoritative settlement payload');
+  assert(
+    typeof mjEndReconAck.settlementExpiresAt === 'number' && mjEndReconAck.settlementExpiresAt > Date.now(),
+    'Reconnected ended Mahjong must include unexpired settlementExpiresAt'
+  );
+
   // Cleanup
-  [outsider, reconClient, raceNewClient, ...ysClients, ...sssClients, ...mjClients].forEach((c) => {
+  [outsider, reconClient, raceNewClient, mjEndReconClient, ...ysClients, ...sssClients, ...mjClients, ...mjEndClients].forEach((c) => {
     try { c.ws.close(); } catch {}
   });
   wss.close();
   httpServer.close();
-  console.log('✅ WebSocket E2E integration tests passed (Yansan 4p, Reject, Reconnect, AuthGuard, MidGameSwitch, Shisanshui Masking/FoulReject, Mahjong 4p, Room Isolation).');
+  console.log('✅ WebSocket E2E integration tests passed (Yansan 4p, Reject, Reconnect, AuthGuard, MidGameSwitch, Shisanshui Masking/FoulReject, Mahjong 4p, Mahjong Ended Reconnect, Room Isolation).');
   process.exit(0);
 }
 
