@@ -430,7 +430,25 @@ async function main() {
     'mj hu check'
   );
   if (mjAfterHuAttempt.event.action === 'hu_rejected') {
-    const discardTile = mjDealerHand[0];
+    // Pick a non-Hongzhong tile from dealer's hand that another player holds >= 2 copies of (if present in deal)
+    const isHz = (t: any) => t && t.type === 'zi' && (Number(t.value) === 5 || t.text === '红中' || t.isRedDragon);
+    let claimCandidate: { tile: any; claimSeat: number; claimClientIdx: number } | null = null;
+    for (const dTile of mjDealerHand) {
+      if (isHz(dTile)) continue;
+      for (let ci = 0; ci < 4; ci++) {
+        const cSeat = mjFullMsgs[ci].assignedSeat;
+        if (cSeat === mjTurnSeat) continue;
+        const cHand: any[] = mjFullMsgs[ci].deal.seatCards[cSeat];
+        const matchCnt = cHand.filter((x) => x.type === dTile.type && Number(x.value) === Number(dTile.value)).length;
+        if (matchCnt >= 2) {
+          claimCandidate = { tile: dTile, claimSeat: cSeat, claimClientIdx: ci };
+          break;
+        }
+      }
+      if (claimCandidate) break;
+    }
+
+    const discardTile = claimCandidate ? claimCandidate.tile : mjDealerHand[0];
     mjClients[mjTurnIdx].ws.send(
       JSON.stringify({
         type: 'game_move',
@@ -439,11 +457,62 @@ async function main() {
         event: { action: 'discard', seat: mjTurnSeat, tile: discardTile },
       })
     );
-    await Promise.all(
+    const mjDiscardEvts = await Promise.all(
       mjClients.map((c, idx) =>
         c.waitFor((m) => m.type === 'game_event' && m.event?.action === 'discard', 3000, `mj-${idx} discard`)
       )
     );
+
+    if (claimCandidate) {
+      assert.equal(
+        mjDiscardEvts[0].event.hasClaimWindow,
+        true,
+        'Discarding tile matching opponent pair must open server claimWindow'
+      );
+      const nextSeatAfterDealer = (mjTurnSeat + 1) % 4;
+      const nextClientIdx = mjFullMsgs.findIndex((m) => m.assignedSeat === nextSeatAfterDealer);
+      mjClients[nextClientIdx].ws.send(
+        JSON.stringify({
+          type: 'game_move',
+          roomId: mjRoomId,
+          seat: nextSeatAfterDealer,
+          event: { action: 'draw', seat: nextSeatAfterDealer },
+        })
+      );
+      const drawBlocked = await mjClients[nextClientIdx].waitFor(
+        (m) => m.type === 'game_event' && m.event?.action === 'draw_rejected',
+        3000,
+        'mj draw_rejected during claimWindow'
+      );
+      assert.equal(drawBlocked.event.reason, 'claim_window_open');
+
+      mjClients[claimCandidate.claimClientIdx].ws.send(
+        JSON.stringify({
+          type: 'game_move',
+          roomId: mjRoomId,
+          seat: claimCandidate.claimSeat,
+          event: {
+            action: 'peng',
+            seat: claimCandidate.claimSeat,
+            tile: discardTile,
+            targetDiscardId: discardTile.id,
+          },
+          payload: {
+            action: 'peng',
+            seat: claimCandidate.claimSeat,
+            tile: discardTile,
+            targetDiscardId: discardTile.id,
+          },
+        })
+      );
+      const pengEvts = await Promise.all(
+        mjClients.map((c, idx) =>
+          c.waitFor((m) => m.type === 'game_event' && m.event?.action === 'peng', 3000, `mj-${idx} peng`)
+        )
+      );
+      assert.equal(pengEvts[0].boardState.turnSeat, claimCandidate.claimSeat);
+      assert.equal(pengEvts[0].boardState.extraState.pendingPengSeat, claimCandidate.claimSeat);
+    }
   }
 
   // Outsider must have received ZERO game_event messages across all rooms!

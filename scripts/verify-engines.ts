@@ -17,6 +17,7 @@ import {
 } from '../src/server/games/yansanServerEngine.ts';
 import {
   executeMahjongWinSettlement,
+  handleMahjongGameMove,
   tickMahjongAutoTurn,
 } from '../src/server/games/mahjongServerEngine.ts';
 import {
@@ -1019,6 +1020,133 @@ function runServerEngineRegressionTests() {
   const forgedMaTiles = Array.from({ length: 8 }, (_, i) => mjTile('wan', 1, `forged-${i}`));
   executeMahjongWinSettlement(mockCtx, forgedWallRoom, 0, false, { maTiles: forgedMaTiles });
   assert.equal(forgedWallRoom.boardState.settlement.hitMaCount, 0, 'Server settlement must draw Ma from remainingWall and ignore client forged maTiles');
+
+  // 8. Mahjong Server Engine: plain-object seatCards must open claimWindow, block draw/discard while open, and allow Peng cleanly
+  const pengTarget = mjTile('wan', 5, 'd1');
+  const fillerHand13 = (prefix: string) =>
+    Array.from({ length: 13 }, (_, i) => mjTile('tiao', (i % 9) + 1, `${prefix}-${i}`));
+  const claimHand2 = [
+    mjTile('wan', 5, 'c1'),
+    mjTile('wan', 5, 'c2'),
+    ...Array.from({ length: 11 }, (_, i) => mjTile('tong', (i % 9) + 1, `c-${i}`)),
+  ];
+  const mjClaimRoom: any = {
+    id: 'test-mj-claim-peng',
+    gameType: 'mahjong',
+    sceneMode: 'hongzhong-6',
+    status: 'playing',
+    moveCount: 0,
+    turnSeat: 0,
+    players: [
+      { id: 'p0', seat: 0 },
+      { id: 'p1', seat: 1 },
+      { id: 'p2', seat: 2 },
+      { id: 'p3', seat: 3 },
+    ],
+    deal: {
+      // Plain Record<number, Tile[]> matching createMahjongDeal output
+      seatCards: {
+        0: [pengTarget, ...fillerHand13('s0')],
+        1: fillerHand13('s1'),
+        2: claimHand2,
+        3: fillerHand13('s3'),
+      },
+      remainingWall: Array.from({ length: 20 }, (_, i) => mjTile('wan', 3, `w-${i}`)),
+    },
+    boardState: {
+      phase: 'playing',
+      turnSeat: 0,
+      handsCount: [14, 13, 13, 13],
+      seatKongScores: [0, 0, 0, 0],
+      extraState: {
+        wallRemaining: 20,
+        mahjongDiscards: [],
+        mahjongMelds: [[], [], [], []],
+        pendingPengSeat: null,
+        claimWindow: null,
+        lastDiscarded: null,
+      },
+    },
+  };
+
+  sentWs.length = 0;
+  handleMahjongGameMove(
+    mockCtx,
+    mockWs,
+    mjClaimRoom,
+    0,
+    'discard',
+    null,
+    { tile: pengTarget, absSeat: 0 },
+    { action: 'discard', tile: pengTarget }
+  );
+  assert.equal(
+    mjClaimRoom.boardState.extraState.claimWindow?.pendingSeats?.includes(2),
+    true,
+    'Discarding matching tile with Record<number, Tile[]> seatCards must open claimWindow for seat 2'
+  );
+
+  // Seat 1 cannot draw while claimWindow is open
+  sentWs.length = 0;
+  handleMahjongGameMove(mockCtx, mockWs, mjClaimRoom, 1, 'draw', null, { absSeat: 1 }, { action: 'draw' });
+  assert.equal(sentWs.length, 1);
+  assert.equal(sentWs[0].event.action, 'draw_rejected');
+  assert.equal(sentWs[0].event.reason, 'claim_window_open');
+
+  // Seat 2 clicks Peng -> succeeds, locks pendingPengSeat = 2, clears claimWindow
+  sentWs.length = 0;
+  handleMahjongGameMove(
+    mockCtx,
+    mockWs,
+    mjClaimRoom,
+    2,
+    'peng',
+    null,
+    { tile: pengTarget, targetDiscardId: pengTarget.id, absSeat: 2 },
+    { action: 'peng', tile: pengTarget }
+  );
+  assert.equal(mjClaimRoom.boardState.extraState.claimWindow, null);
+  assert.equal(mjClaimRoom.boardState.extraState.pendingPengSeat, 2);
+  assert.equal(mjClaimRoom.boardState.turnSeat, 2);
+  assert.equal(mjClaimRoom.deal.seatCards[2].length, 11);
+  assert.equal(mjClaimRoom.boardState.extraState.mahjongMelds[2].length, 1);
+
+  // Seat 1 still cannot draw while seat 2 has pendingPengSeat
+  sentWs.length = 0;
+  handleMahjongGameMove(mockCtx, mockWs, mjClaimRoom, 1, 'draw', null, { absSeat: 1 }, { action: 'draw' });
+  assert.equal(sentWs.length, 1);
+  assert.equal(sentWs[0].event.action, 'draw_rejected');
+  assert.equal(sentWs[0].event.reason, 'pending_peng');
+
+  // Duplicate Peng by seat 2 is rejected cleanly
+  sentWs.length = 0;
+  handleMahjongGameMove(
+    mockCtx,
+    mockWs,
+    mjClaimRoom,
+    2,
+    'peng',
+    null,
+    { tile: pengTarget, targetDiscardId: pengTarget.id, absSeat: 2 },
+    { action: 'peng', tile: pengTarget }
+  );
+  assert.equal(sentWs.length, 1);
+  assert.equal(sentWs[0].event.action, 'claim_rejected');
+
+  // Seat 2 discards post-Peng -> clears pendingPengSeat and advances turn to seat 3
+  const postPengDiscard = mjClaimRoom.deal.seatCards[2][0];
+  handleMahjongGameMove(
+    mockCtx,
+    mockWs,
+    mjClaimRoom,
+    2,
+    'discard',
+    null,
+    { tile: postPengDiscard, absSeat: 2 },
+    { action: 'discard', tile: postPengDiscard }
+  );
+  assert.equal(mjClaimRoom.boardState.extraState.pendingPengSeat, null);
+  assert.equal(mjClaimRoom.boardState.turnSeat, 3);
 }
 
 runYansanTests();

@@ -226,7 +226,7 @@ export function computeMahjongClaimPendingSeats(room: any, bs: any, discardSeat:
   if (isHongzhongMode && isRedDragonTile(discTile)) return [];
 
   const seatCardsAll = (room as any).deal?.seatCards;
-  if (!Array.isArray(seatCardsAll)) return [];
+  if (!seatCardsAll || typeof seatCardsAll !== 'object') return [];
 
   const pending: number[] = [];
   for (let s = 0; s < 4; s++) {
@@ -293,7 +293,7 @@ export function handleMahjongGameMove(
           seat,
           event: rejectEvt,
           payload: rejectEvt,
-          boardState: bs,
+          boardState: sanitizeBoardStateForSeat(bs, 'mahjong', seat),
         })
       );
     } catch {}
@@ -302,6 +302,11 @@ export function handleMahjongGameMove(
   const tile = p.tile || evt.tile;
 
   if (action === 'discard') {
+    const cwOpen = bs.extraState.claimWindow;
+    if (cwOpen && Array.isArray(cwOpen.pendingSeats) && cwOpen.pendingSeats.some((ps: number) => !(cwOpen.passedSeats || []).includes(ps))) {
+      sendMahjongReject('discard_rejected', 'claim_window_open', { tile });
+      return;
+    }
     const sCards: any[] | undefined = (room as any).deal?.seatCards?.[seat];
     if (
       (bs.extraState.pendingPengSeat !== null &&
@@ -348,7 +353,7 @@ export function handleMahjongGameMove(
       bs.handsCount[seat] = Math.max(0, bs.handsCount[seat] - 1);
     }
 
-    const nextTurnSeat = p.nextTurn !== undefined ? Number(p.nextTurn) : (seat + 1) % 4;
+    const nextTurnSeat = (seat + 1) % 4;
     bs.turnSeat = nextTurnSeat;
     room.turnSeat = nextTurnSeat;
     bs.extraState.pendingPengSeat = null;
@@ -394,6 +399,7 @@ export function handleMahjongGameMove(
     }));
 
     if (pendingClaimSeats.length === 0) {
+      bs.extraState.lastDiscarded = null;
       if (Array.isArray(wallArr) && wallArr.length === 0) {
         executeMahjongDrawStalemate(ctx, room, nextTurnSeat, '牌墙抓毕，本局荒庄（流局）！');
       } else {
@@ -834,6 +840,7 @@ export function handleMahjongGameMove(
         const nextTurnSeat = (cw.discarderSeat + 1) % 4;
         const resolvedDiscardId = cw.discardId;
         bs.extraState.claimWindow = null;
+        bs.extraState.lastDiscarded = null;
         bs.turnSeat = nextTurnSeat;
         room.turnSeat = nextTurnSeat;
         room.moveCount = (room.moveCount || 0) + 1;
@@ -928,17 +935,17 @@ export function handleMahjongGameMove(
     }
   }
 
-  const resolvedNextTurn = p.nextTurn !== undefined ? Number(p.nextTurn) : bs.turnSeat;
+  const resolvedNextTurn = bs.turnSeat;
   ctx.sendSanitizedToRoom(room, (rSeat) => {
     const maskedEvt: any = {
       action,
       seat,
       combo,
+      ...p,
       nextTurn: resolvedNextTurn,
       winner: bs.winnerSeat ?? p.winner,
       finishedSeats: bs.finishedSeats || p.finishedSeats,
       allianceScoreResult: bs.allianceScoreResult || p.allianceScoreResult,
-      ...p,
     };
     if (action === 'draw' && rSeat !== seat && maskedEvt.tile) {
       maskedEvt.tile = maskHiddenMahjongTile(maskedEvt.tile);
@@ -966,10 +973,11 @@ export function tickMahjongClaimWindow(ctx: RealtimeHubContext, room: any, now: 
     return false;
   }
   const cw = room.boardState.extraState.claimWindow;
-  if (now - cw.createdAt > 10500) {
+  if (now - cw.createdAt > 12500) {
     const nextTurnSeat = (cw.discarderSeat + 1) % 4;
     const resolvedDiscardId = cw.discardId;
     room.boardState.extraState.claimWindow = null;
+    room.boardState.extraState.lastDiscarded = null;
     room.boardState.turnSeat = nextTurnSeat;
     room.turnSeat = nextTurnSeat;
     room.lastTurnTs = now;
@@ -1162,6 +1170,7 @@ export function tickMahjongAutoTurn(ctx: RealtimeHubContext, room: any, currentS
   }));
 
   if (pendingClaimSeats.length === 0) {
+    room.boardState.extraState.lastDiscarded = null;
     if (wall.length === 0) {
       executeMahjongDrawStalemate(ctx, room, nextSeat, '牌墙已摸空，荒牌流局！');
     } else {

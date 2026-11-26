@@ -2337,7 +2337,8 @@ export function createRealtimeHub(wss: WebSocketServer): (payload: unknown) => v
         room.gameType === 'mahjong' &&
         Array.isArray(mjDealForThreshold?.remainingWall) &&
         mjDealForThreshold.remainingWall.length === 0 &&
-        !room.boardState.extraState?.pendingPengSeat;
+        (room.boardState.extraState?.pendingPengSeat === null ||
+          room.boardState.extraState?.pendingPengSeat === undefined);
       const baseTimeoutThreshold = isConnectedManualAuto ? 2600 : isPlayerAuto ? 1200 : 60000;
       const isYansanBaoDan =
         room.gameType === 'yansan' &&
