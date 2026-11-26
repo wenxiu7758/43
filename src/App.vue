@@ -748,28 +748,6 @@
       @start-game="onFullSeatGameStart"
     />
 
-    <!-- ======================================================== -->
-    <!-- VIEW 7: SCENE MATCHING WAITING ROOM (选定场景后等待玩家入座，满座自动开局) -->
-    <!-- ======================================================== -->
-    <SceneWaitingRoom
-      v-else-if="currentView === 'waiting-room'"
-      :game-type="activeGameType"
-      :scene-mode="activeSceneMode"
-      :scene-name="currentSceneDisplayName"
-      :base-stake="currentSceneBaseStake"
-      :max-players="currentSceneMaxPlayers"
-      :current-user="userProfile"
-      :ws="wsRef"
-      :ws-connected="wsConnected"
-      :table-theme="currentTheme"
-      :is-rotated-90="isRotated90"
-      :is-practice-mode="isPracticeMode"
-      @leave="returnToLobby"
-      @change-scene="onChangeSceneFromWaitingRoom"
-      @start-game="onFullSeatGameStart"
-      @open-points="openPointsModal"
-    />
-
     <!-- Modals -->
     <!-- 1. 注册登录弹窗 (始终竖屏显示，适配手机竖屏输入法键盘) -->
     <AuthModal
@@ -1000,8 +978,7 @@ import MahjongCanvas from './components/canvas/MahjongCanvas.vue';
 import MahjongSceneModal, { MahjongSceneMode } from './components/MahjongSceneModal.vue';
 import ShisanshuiSceneModal, { ShisanshuiSceneMode } from './components/ShisanshuiSceneModal.vue';
 import YansanSceneModal, { YansanSceneMode } from './components/YansanSceneModal.vue';
-import SceneWaitingRoom, { ScenePlayer } from './components/SceneWaitingRoom.vue';
-import TeahouseChatroom from './components/TeahouseChatroom.vue';
+import TeahouseChatroom, { type ScenePlayer } from './components/TeahouseChatroom.vue';
 import GameRulesModal from './components/GameRulesModal.vue';
 import {
   QUICK_PHRASES,
@@ -1119,7 +1096,7 @@ const customVoiceInput = ref('');
 const recentVoicedHistory = reactive<VoicedHistoryItem[]>([]);
 
 // Reactive states
-const currentView = ref<'lobby' | 'arena' | 'mahjong-scenes' | 'shisanshui-scenes' | 'yansan-scenes' | 'waiting-room' | 'chatroom'>('lobby');
+const currentView = ref<'lobby' | 'arena' | 'mahjong-scenes' | 'shisanshui-scenes' | 'yansan-scenes' | 'chatroom'>('lobby');
 const hasSelectedScene = ref(false);
 const activeGameType = ref<GameType | ''>('');
 const activeRoomId = ref('');
@@ -1331,28 +1308,6 @@ const currentSceneDisplayName = computed(() => {
     return '经典烟三 · 5--10分场';
   }
   return '未加入任何游戏';
-});
-
-const currentSceneMaxPlayers = computed(() => {
-  if (activeGameType.value === 'shisanshui') {
-    if (activeShisanshuiScene.value === 'eight-realtime' || activeShisanshuiScene.value === 'eight-booking') {
-      return 8;
-    }
-  }
-  return 4;
-});
-
-const currentSceneBaseStake = computed(() => {
-  if (activeGameType.value === 'mahjong') {
-    return getSceneRequiredCoins('mahjong', activeSceneMode.value || activeMahjongScene.value);
-  }
-  if (activeGameType.value === 'shisanshui') {
-    return getSceneRequiredCoins('shisanshui', activeSceneMode.value || activeShisanshuiScene.value);
-  }
-  if (activeGameType.value === 'yansan') {
-    return getSceneRequiredCoins('yansan', activeSceneMode.value || activeYansanScene.value);
-  }
-  return 100;
 });
 
 // Danmaku and Teahouse Dialogue State
@@ -1824,7 +1779,7 @@ function enterGame(gt: GameType) {
   activeGameType.value = gt;
   currentTheme.value = getGameTheme(gt);
   currentWaitingRoomPlayers.value = [];
-  currentView.value = 'waiting-room';
+  currentView.value = 'chatroom';
   notifyPresence(gt);
   soundFX.playTap();
 }
@@ -2105,29 +2060,6 @@ function onSelectYansanScene(mode: YansanSceneMode) {
   currentView.value = 'chatroom';
   notifyPresence('yansan', mode);
   sendSceneJoinOverWs('yansan', mode);
-  soundFX.playTap();
-}
-
-function onChangeSceneFromWaitingRoom() {
-  if (!isPracticeMode.value && ws && ws.readyState === WebSocket.OPEN && (activeRoomId.value || activeGameType.value)) {
-    try {
-      ws.send(JSON.stringify({
-        type: 'scene_leave',
-        roomId: activeRoomId.value,
-        gameType: activeGameType.value,
-        sceneMode: activeSceneMode.value,
-        playerId: myAssignedPlayerId.value || userProfile.id || 'P-me',
-        playerName: userProfile.name,
-      }));
-    } catch {}
-  }
-  activeRoomId.value = '';
-  currentWaitingRoomPlayers.value = [];
-  currentRoomDeal.value = null;
-  lastSceneReconnectSnapshot.value = null;
-  if (activeGameType.value === 'mahjong') currentView.value = 'mahjong-scenes';
-  else if (activeGameType.value === 'shisanshui') currentView.value = 'shisanshui-scenes';
-  else currentView.value = 'yansan-scenes';
   soundFX.playTap();
 }
 
@@ -2457,14 +2389,14 @@ function syncActiveStateAfterReconnect(showRestoreBadge = false) {
         !isPracticeMode.value &&
         ws &&
         ws.readyState === WebSocket.OPEN &&
-        (currentView.value === 'arena' || currentView.value === 'waiting-room' || Boolean(getActiveGameLock())) &&
+        (currentView.value === 'arena' || Boolean(getActiveGameLock())) &&
         isRealSceneRoomId(activeRoomId.value || currentLock?.roomId)
       ) {
         sendSceneReconnect();
       }
     }, 3500);
   } else if (
-    (currentView.value === 'chatroom' || currentView.value === 'waiting-room') &&
+    currentView.value === 'chatroom' &&
     hasSelectedScene.value &&
     activeGameType.value &&
     activeSceneMode.value &&
@@ -2708,7 +2640,8 @@ function connectWs(forceReconnect = false) {
             }
             clearActiveGameLock();
             if (matchedReconnSelf && activeGameType.value && activeSceneMode.value) {
-              currentView.value = 'waiting-room';
+              hasSelectedScene.value = true;
+              currentView.value = 'chatroom';
             } else {
               returnToLobby(true);
             }
@@ -2731,11 +2664,11 @@ function connectWs(forceReconnect = false) {
           }
           clearActiveGameLock();
           activeRoomId.value = '';
-          if (hadPendingLockOrArena && !isPracticeMode.value && currentView.value !== 'waiting-room' && currentView.value !== 'chatroom') {
+          if (hadPendingLockOrArena && !isPracticeMode.value && currentView.value !== 'chatroom') {
             returnToLobby(true);
             triggerSpeechBubble('⏱️ 当前牌桌已结束或结算超时，已自动返回大厅');
           } else if (
-            (currentView.value === 'chatroom' || currentView.value === 'waiting-room') &&
+            currentView.value === 'chatroom' &&
             hasSelectedScene.value &&
             activeGameType.value &&
             activeSceneMode.value &&
@@ -2785,7 +2718,8 @@ function connectWs(forceReconnect = false) {
               currentRoomDeal.value = null;
               lastSceneReconnectSnapshot.value = null;
               if (matchedUpdateSelf) {
-                currentView.value = 'waiting-room';
+                hasSelectedScene.value = true;
+                currentView.value = 'chatroom';
               } else {
                 returnToLobby(true);
               }
@@ -3872,7 +3806,8 @@ onMounted(() => {
         if (autoGame === 'yansan') activeYansanScene.value = autoScene as any;
         currentTheme.value = getGameTheme(autoGame);
         currentWaitingRoomPlayers.value = [];
-        currentView.value = 'waiting-room';
+        hasSelectedScene.value = true;
+        currentView.value = 'chatroom';
       }
     }
   } catch {}
