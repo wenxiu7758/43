@@ -310,23 +310,51 @@ func buildTelegramAdminKeyboard() map[string]interface{} {
 }
 
 type exportedPointsTxt struct {
-	TxtContent      string
-	FileName        string
-	SafeFileName    string
-	SummaryTextHTML string
+	TxtContent          string
+	FileName            string
+	SafeFileName        string
+	SummaryTextHTML     string
+	LeaderboardMarkdown string
+	PlayerCount         int
+	TotalCoins          int
+}
+
+func sanitizeTelegramMdName(s string) string {
+	replacer := strings.NewReplacer("*", "", "_", "", "`", "", "[", "", "]", "", "\\", "")
+	return strings.TrimSpace(replacer.Replace(s))
+}
+
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	if maxRunes <= 3 {
+		return string(runes[:maxRunes])
+	}
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 func exportPlayersPointsTxt(db *DatabaseSchema) exportedPointsTxt {
-	profiles := make([]*UserProfile, 0, len(db.Profiles))
+	var profiles []*UserProfile
 	totalCoins := 0
-	for _, p := range db.Profiles {
-		if p != nil {
-			profiles = append(profiles, p)
-			totalCoins += p.Coins
+	if db != nil {
+		profiles = make([]*UserProfile, 0, len(db.Profiles))
+		for _, p := range db.Profiles {
+			if p != nil {
+				profiles = append(profiles, p)
+				totalCoins += p.Coins
+			}
 		}
 	}
 	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Coins > profiles[j].Coins
+		if profiles[i].Coins != profiles[j].Coins {
+			return profiles[i].Coins > profiles[j].Coins
+		}
+		return profiles[i].UpdatedAt > profiles[j].UpdatedAt
 	})
 
 	now := time.Now().In(shanghaiZone)
@@ -351,7 +379,13 @@ func exportPlayersPointsTxt(db *DatabaseSchema) exportedPointsTxt {
 		b.WriteString("(暂无注册玩家资料)\r\n")
 	} else {
 		for idx, p := range profiles {
-			pPhone := strings.TrimSpace(p.Phone)
+			pPhone := normalizePhone(p.Phone)
+			if pPhone == "" {
+				pPhone = normalizePhone(p.Username)
+			}
+			if pPhone == "" {
+				pPhone = strings.TrimSpace(p.Phone)
+			}
 			if pPhone == "" {
 				pPhone = "未绑定"
 			}
@@ -363,7 +397,7 @@ func exportPlayersPointsTxt(db *DatabaseSchema) exportedPointsTxt {
 			if p.UpdatedAt > 0 {
 				lastActive = formatShanghaiTime(p.UpdatedAt)
 			}
-			name := p.Name
+			name := strings.NewReplacer("|", "｜", "\r", " ", "\n", " ").Replace(strings.TrimSpace(p.Name))
 			if name == "" {
 				name = "无名茶客"
 			}
@@ -392,15 +426,81 @@ func exportPlayersPointsTxt(db *DatabaseSchema) exportedPointsTxt {
 		escapeHTMLText(timeStr), len(profiles), formatIntComma(totalCoins),
 	)
 
+	var md strings.Builder
+	md.WriteString(fmt.Sprintf(
+		"📄 *【全服玩家积分 TXT 榜单】*\n\n"+
+			"• 🕒 *备份时刻*: `%s`\n"+
+			"• 👥 *注册玩家总数*: *%d* 人\n"+
+			"• 🪙 *全服筹码总额*: *%s* 分\n\n"+
+			"🏆 *玩家积分排行榜*:\n",
+		timeStr, len(profiles), formatIntComma(totalCoins),
+	))
+	if len(profiles) == 0 {
+		md.WriteString("• (暂无注册玩家资料，可在 Bot 中直接发送手机号授权建档)\n")
+	} else {
+		shown := 0
+		maxShow := 35
+		for idx, p := range profiles {
+			if shown >= maxShow {
+				break
+			}
+			pPhone := normalizePhone(p.Phone)
+			if pPhone == "" {
+				pPhone = normalizePhone(p.Username)
+			}
+			if pPhone == "" {
+				pPhone = strings.TrimSpace(p.Phone)
+			}
+			if pPhone == "" {
+				pPhone = "未绑"
+			}
+			safeName := sanitizeTelegramMdName(p.Name)
+			if safeName == "" {
+				safeName = "无名茶客"
+			}
+			av := p.Avatar
+			if av == "" {
+				av = "👤"
+			}
+			lv := p.Level
+			if lv <= 0 {
+				lv = 1
+			}
+			statusBadge := "📱待首登"
+			if p.IsBanned {
+				statusBadge = "🚫已封禁"
+			} else if p.Password != "" {
+				statusBadge = "🟢已激活"
+			}
+			adm := ""
+			if p.IsAdmin {
+				adm = " 👑"
+			}
+			line := fmt.Sprintf("%d. %s *%s* (📱 `%s`) — 🪙 *%s* 分 | Lv.%d · %s%s\n",
+				idx+1, av, safeName, pPhone, formatIntComma(p.Coins), lv, statusBadge, adm)
+			if md.Len()+len(line) > 3500 {
+				break
+			}
+			md.WriteString(line)
+			shown++
+		}
+		if len(profiles) > shown {
+			md.WriteString(fmt.Sprintf("\n... 还有 *%d* 位玩家未完整展开，完整数据详见随附 TXT 榜单文件。\n", len(profiles)-shown))
+		}
+	}
+
 	return exportedPointsTxt{
-		TxtContent:      b.String(),
-		FileName:        fileName,
-		SafeFileName:    safeFileName,
-		SummaryTextHTML: summaryHTML,
+		TxtContent:          b.String(),
+		FileName:            fileName,
+		SafeFileName:        safeFileName,
+		SummaryTextHTML:     summaryHTML,
+		LeaderboardMarkdown: strings.TrimRight(md.String(), "\n"),
+		PlayerCount:         len(profiles),
+		TotalCoins:          totalCoins,
 	}
 }
 
-func (tm *TelegramManager) notifyPointsTxtToTelegram(sm *StorageManager, reason string, db *DatabaseSchema, targetChatID string) bool {
+func (tm *TelegramManager) notifyPointsTxtWithExport(sm *StorageManager, reason string, exp exportedPointsTxt, targetChatID string, timeout time.Duration) bool {
 	botToken := getTelegramBotToken(sm)
 	chatID := strings.TrimSpace(targetChatID)
 	if chatID == "" {
@@ -409,19 +509,12 @@ func (tm *TelegramManager) notifyPointsTxtToTelegram(sm *StorageManager, reason 
 	if botToken == "" || chatID == "" {
 		return false
 	}
-
-	if db == nil {
-		sm.WithDBRead(func(loaded *DatabaseSchema) {
-			db = loaded
-		})
-	}
-	if db == nil {
-		return false
+	if timeout <= 0 {
+		timeout = 15 * time.Second
 	}
 
-	exp := exportPlayersPointsTxt(db)
 	apiBase := getTelegramAPIBase(sm)
-	captionHTML := fmt.Sprintf("%s\n\n📌 <b>数据变动来源</b>: %s", exp.SummaryTextHTML, escapeHTMLText(reason))
+	captionHTML := truncateRunes(fmt.Sprintf("%s\n\n📌 <b>数据变动来源</b>: %s", exp.SummaryTextHTML, escapeHTMLText(reason)), 1000)
 
 	sendDoc := func(caption, parseMode string) bool {
 		var bodyBuf bytes.Buffer
@@ -446,7 +539,7 @@ func (tm *TelegramManager) notifyPointsTxtToTelegram(sm *StorageManager, reason 
 			return false
 		}
 		req.Header.Set("Content-Type", mw.FormDataContentType())
-		client := &http.Client{Timeout: 15 * time.Second}
+		client := &http.Client{Timeout: timeout}
 		resp, err := client.Do(req)
 		if err != nil {
 			return false
@@ -464,9 +557,23 @@ func (tm *TelegramManager) notifyPointsTxtToTelegram(sm *StorageManager, reason 
 	if sendDoc(captionHTML, "HTML") {
 		return true
 	}
-	plainCaption := fmt.Sprintf("📄 【全服玩家积分 TXT 备份】\n备份时间: %s\n玩家总数: %d\n变动原因: %s",
-		formatShanghaiTime(0), len(db.Profiles), reason)
+	plainCaption := truncateRunes(fmt.Sprintf("📄 【全服玩家积分 TXT 备份】\n备份时间: %s\n玩家总数: %d\n变动原因: %s",
+		formatShanghaiTime(0), exp.PlayerCount, reason), 1000)
 	return sendDoc(plainCaption, "")
+}
+
+func (tm *TelegramManager) notifyPointsTxtToTelegram(sm *StorageManager, reason string, db *DatabaseSchema, targetChatID string) bool {
+	var exp exportedPointsTxt
+	if db == nil {
+		_ = sm.WithDBWrite(func(loaded *DatabaseSchema) bool {
+			changed := sm.syncAuthorizedProfilesLocked(loaded)
+			exp = exportPlayersPointsTxt(loaded)
+			return changed
+		})
+	} else {
+		exp = exportPlayersPointsTxt(db)
+	}
+	return tm.notifyPointsTxtWithExport(sm, reason, exp, targetChatID, 15*time.Second)
 }
 
 func (tm *TelegramManager) triggerDebouncedTxtBackup(sm *StorageManager, reason string, targetChatID string) {
@@ -489,11 +596,13 @@ func (tm *TelegramManager) triggerDebouncedTxtBackup(sm *StorageManager, reason 
 		tm.backupTimer = nil
 		tm.mu.Unlock()
 		combined := strings.Join(uniq, "; ")
-		var snapDB *DatabaseSchema
-		sm.WithDBRead(func(d *DatabaseSchema) {
-			snapDB = d
+		var exp exportedPointsTxt
+		_ = sm.WithDBWrite(func(d *DatabaseSchema) bool {
+			changed := sm.syncAuthorizedProfilesLocked(d)
+			exp = exportPlayersPointsTxt(d)
+			return changed
 		})
-		tm.notifyPointsTxtToTelegram(sm, combined, snapDB, targetChatID)
+		tm.notifyPointsTxtWithExport(sm, combined, exp, targetChatID, 15*time.Second)
 	})
 	tm.mu.Unlock()
 }
@@ -933,15 +1042,19 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 	}
 	tm.mu.Unlock()
 
+	clearPend := func() {
+		tm.mu.Lock()
+		delete(tm.pendingStates, senderKey)
+		tm.mu.Unlock()
+	}
+
 	if m := tgPhonePointsRe.FindStringSubmatch(trimmed); len(m) > 2 {
 		if strings.HasPrefix(m[2], "-") {
 			rawText = "/subpoints " + m[1] + " " + strings.TrimPrefix(m[2], "-")
 		} else {
 			rawText = "/addpoints " + m[1] + " " + strings.TrimPrefix(m[2], "+")
 		}
-		tm.mu.Lock()
-		delete(tm.pendingStates, senderKey)
-		tm.mu.Unlock()
+		clearPend()
 	} else if hasPend && pend.TargetPhone != "" && tgDigitsOnlyRe.MatchString(trimmed) {
 		numStr := strings.TrimPrefix(trimmed, "+")
 		switch pend.Action {
@@ -952,9 +1065,7 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 		case "setpoints":
 			rawText = "/setpoints " + pend.TargetPhone + " " + numStr
 		}
-		tm.mu.Lock()
-		delete(tm.pendingStates, senderKey)
-		tm.mu.Unlock()
+		clearPend()
 	} else if m := tgPhoneOnlyRe.FindStringSubmatch(trimmed); len(m) > 1 {
 		targetPhone := m[1]
 		if hasPend {
@@ -971,80 +1082,93 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 		} else {
 			rawText = "/authphone " + targetPhone
 		}
-		tm.mu.Lock()
-		delete(tm.pendingStates, senderKey)
-		tm.mu.Unlock()
-	} else if hasPend && pend.Action == "broadcast" && !strings.HasPrefix(trimmed, "/") {
-		rawText = "/broadcast " + trimmed
-		tm.mu.Lock()
-		delete(tm.pendingStates, senderKey)
-		tm.mu.Unlock()
+		clearPend()
 	} else if m := tgFindPhoneRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/findphone " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/findphone"
 		}
+		clearPend()
 	} else if tgClearUsersRe.MatchString(trimmed) {
 		rawText = "/clearusers"
+		clearPend()
 	} else if m := tgDelUserRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/deluser " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/deluser"
 		}
+		clearPend()
 	} else if m := tgDelPhoneRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/delphone " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/delphone"
 		}
+		clearPend()
 	} else if m := tgAuthPhoneRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/authphone " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/authphone"
 		}
+		clearPend()
 	} else if m := tgAddPointsRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/addpoints " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/addpoints"
 		}
+		clearPend()
 	} else if m := tgSubPointsRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/subpoints " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/subpoints"
 		}
+		clearPend()
 	} else if m := tgSetPointsRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/setpoints " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/setpoints"
 		}
+		clearPend()
 	} else if m := tgBroadcastRe.FindStringSubmatch(trimmed); m != nil {
 		if strings.TrimSpace(m[1]) != "" {
 			rawText = "/broadcast " + strings.TrimSpace(m[1])
 		} else {
 			rawText = "/broadcast"
 		}
+		clearPend()
 	} else if tgExportTxtRe.MatchString(trimmed) {
 		rawText = "/exporttxt"
+		clearPend()
 	} else if trimmed == "👥 玩家名册" || strings.Contains(trimmed, "玩家名册") || strings.Contains(trimmed, "查看玩家") || trimmed == "用户列表" {
 		rawText = "/users"
+		clearPend()
 	} else if strings.Contains(trimmed, "运营统计") {
 		rawText = "/stats"
+		clearPend()
 	} else if strings.Contains(trimmed, "匹配池") || strings.Contains(trimmed, "匹配监控") {
 		rawText = "/matchpool"
+		clearPend()
 	} else if strings.Contains(trimmed, "白名单列表") || strings.Contains(trimmed, "授权列表") || trimmed == "白名单" {
 		rawText = "/whitelist"
+		clearPend()
 	} else if strings.Contains(trimmed, "牌桌巡视") || strings.Contains(trimmed, "巡视牌桌") {
 		rawText = "/rooms"
+		clearPend()
 	} else if strings.Contains(trimmed, "审计日志") || strings.Contains(trimmed, "操作日志") {
 		rawText = "/logs"
+		clearPend()
 	} else if strings.Contains(trimmed, "帮助") || strings.Contains(trimmed, "菜单") || strings.Contains(trimmed, "指南") {
 		rawText = "/help"
+		clearPend()
+	} else if hasPend && pend.Action == "broadcast" && !strings.HasPrefix(trimmed, "/") {
+		rawText = "/broadcast " + trimmed
+		clearPend()
 	}
 
 	parts := strings.Fields(rawText)
@@ -1053,6 +1177,9 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 	arg2 := ""
 	if len(parts) > 0 {
 		cmd = strings.ToLower(parts[0])
+		if atIdx := strings.IndexByte(cmd, '@'); atIdx > 0 {
+			cmd = cmd[:atIdx]
+		}
 	}
 	if len(parts) > 1 {
 		arg1 = parts[1]
@@ -1091,11 +1218,24 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 			"• `/broadcast <通告内容>` - 向全服所有房间发送广播通告"
 
 	case "/txt", "/exporttxt":
-		var snap *DatabaseSchema
-		h.storage.WithDBRead(func(db *DatabaseSchema) { snap = db })
-		exp := exportPlayersPointsTxt(snap)
-		go tm.notifyPointsTxtToTelegram(h.storage, "管理员手动导出玩家积分TXT榜单", snap, chatID)
-		reply = exp.SummaryTextHTML + "\n\n📄 *已为您实时生成全量玩家积分 TXT 榜单，并作为文件附件推送到当前 Telegram 会话中！*\n（可随时用于 Termux 硬件故障报废时的全量还原）"
+		var exp exportedPointsTxt
+		_ = h.storage.WithDBWrite(func(db *DatabaseSchema) bool {
+			changed := h.storage.syncAuthorizedProfilesLocked(db)
+			exp = exportPlayersPointsTxt(db)
+			return changed
+		})
+		hasToken := getTelegramBotToken(h.storage) != ""
+		docSent := false
+		if chatID != "" && hasToken {
+			docSent = tm.notifyPointsTxtWithExport(h.storage, "管理员手动导出玩家积分TXT榜单", exp, chatID, 6*time.Second)
+		}
+		footer := "\n\n⚠️ _上方已完整展示玩家积分榜单；TXT 文件附件推送超时或受网络限制，请检查反代配置或通过管理端导出下载。_"
+		if docSent {
+			footer = "\n\n📄 *已同步将完整 TXT 榜单文件附件推送到当前 Telegram 会话中！*\n（可随时用于 Termux 硬件故障报废时的全量还原）"
+		} else if chatID == "" || !hasToken {
+			footer = "\n\n💡 _当前未配置主动推送文件通道，上方已完整展示玩家积分榜单。_"
+		}
+		reply = exp.LeaderboardMarkdown + footer
 
 	case "/findphone", "/searchphone", "/finduser":
 		if arg1 == "" {
@@ -1239,14 +1379,7 @@ func (tm *TelegramManager) executeTelegramUpdate(h *Hub, body map[string]interfa
 	case "/users":
 		var list []*UserProfile
 		_ = h.storage.WithDBWrite(func(db *DatabaseSchema) bool {
-			allowedPhones, adminPhones := h.storage.getAllowedAndAdminPhones(db)
-			added := false
-			for _, ap := range append(allowedPhones, adminPhones...) {
-				if len(ap) >= 5 && findUserInDB(ap, db) == nil {
-					h.storage.ensureUserProfile(ap, db, 0)
-					added = true
-				}
-			}
+			added := h.storage.syncAuthorizedProfilesLocked(db)
 			for _, p := range db.Profiles {
 				if p != nil {
 					list = append(list, p)

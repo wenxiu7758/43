@@ -1631,7 +1631,13 @@ export async function handleApiRoute(
       }
 
       db.authorizedPhones = Array.from(current);
+      for (const p of list) {
+        if (p.length >= 5) {
+          ensureUserProfile(p, db, 0);
+        }
+      }
       saveDatabase(db);
+      broadcastTeahousePlayersRoster(broadcast, db);
 
       recordAdminLog(
         'WHITELIST_ADD',

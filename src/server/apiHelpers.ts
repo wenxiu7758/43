@@ -148,28 +148,57 @@ export function normalizePhone(raw: string): string {
   return p;
 }
 
-export function getAllowedAndAdminPhones(): { allowedPhones: string[]; adminPhones: string[]; adminUsernames: string[] } {
-  const db = loadDatabase();
+export function getAllowedAndAdminPhones(dbArg?: any): { allowedPhones: string[]; adminPhones: string[]; adminUsernames: string[] } {
+  const db = dbArg || loadDatabase();
   const adminUsernames = getAdminUsernamesFromEnv();
-  const revokedSet = new Set<string>((db.revokedPhones || []).map((p: any) => normalizePhone(p)));
+  const revokedSet = new Set<string>((db.revokedPhones || []).map((p: any) => normalizePhone(p)).filter(Boolean));
+  const splitEnvPhones = (raw?: string) =>
+    String(raw || '')
+      .split(/[\s,;]+/)
+      .map((p) => normalizePhone(p))
+      .filter((p) => p && !revokedSet.has(p));
 
-  const allowedSet = new Set<string>(
-    (db.authorizedPhones || [])
+  const adminSet = new Set<string>([
+    ...splitEnvPhones(process.env.TELEGRAM_ADMIN_PHONE),
+    ...splitEnvPhones(process.env.ADMIN_PHONES),
+    ...(db.adminPhones || [])
       .map((p: any) => normalizePhone(p))
-      .filter((p: string) => p && !revokedSet.has(p))
-  );
+      .filter((p: string) => p && !revokedSet.has(p)),
+  ]);
 
-  const adminSet = new Set<string>(
-    (db.adminPhones || [])
+  const allowedSet = new Set<string>([
+    ...splitEnvPhones(process.env.ALLOWED_PHONES),
+    ...(db.authorizedPhones || [])
       .map((p: any) => normalizePhone(p))
-      .filter((p: string) => p && !revokedSet.has(p))
-  );
+      .filter((p: string) => p && !revokedSet.has(p)),
+    ...adminSet,
+  ]);
 
   return {
     allowedPhones: Array.from(allowedSet),
     adminPhones: Array.from(adminSet),
     adminUsernames,
   };
+}
+
+export function syncAuthorizedProfilesToDb(db: any): boolean {
+  if (!db) return false;
+  if (!db.profiles || typeof db.profiles !== 'object') {
+    db.profiles = {};
+  }
+  const { allowedPhones, adminPhones } = getAllowedAndAdminPhones(db);
+  const allAuthPhones = Array.from(new Set([...allowedPhones, ...adminPhones]));
+  let addedAny = false;
+  for (const ap of allAuthPhones) {
+    if (ap && ap.length >= 5) {
+      const found = findUser(ap, db);
+      if (!found) {
+        ensureUserProfile(ap, db, 0);
+        addedAny = true;
+      }
+    }
+  }
+  return addedAny;
 }
 
 export function findUser(query: string, db = loadDatabase()): UserProfileData | null {

@@ -13,6 +13,7 @@ import {
   getAllowedAndAdminPhones,
   findUser,
   ensureUserProfile,
+  syncAuthorizedProfilesToDb,
   broadcastTeahousePlayersRoster,
 } from './apiHelpers.ts';
 
@@ -96,20 +97,56 @@ export function buildTelegramAdminKeyboard() {
   };
 }
 
+function sanitizeMarkdownText(str: string): string {
+  return String(str || '').replace(/[*_`\[\]\\]/g, '');
+}
+
+function getShanghaiDateParts(now = new Date()): { timeStr: string; dateTag: string } {
+  const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+  const partMap: Record<string, string> = {};
+  for (const part of fmt.formatToParts(now)) {
+    partMap[part.type] = part.value;
+  }
+  const hh = partMap.hour === '24' ? '00' : (partMap.hour || '00');
+  const dateTag = `${partMap.year || now.getFullYear()}${partMap.month || '01'}${partMap.day || '01'}_${hh}${partMap.minute || '00'}${partMap.second || '00'}`;
+  return { timeStr, dateTag };
+}
+
 /**
  * 自动生成所有玩家筹码/积分的全量 TXT 备份文档，方便 Termux 硬件报废损毁时极速还原数据
  */
-export function exportPlayersPointsTxt(db?: any): { txtContent: string; fileName: string; safeFileName: string; summaryTextHtml: string } {
-  const database = db || loadDatabase();
-  const profiles = Object.values(database.profiles || {}) as UserProfileData[];
+export function exportPlayersPointsTxt(db?: any): {
+  txtContent: string;
+  fileName: string;
+  safeFileName: string;
+  summaryTextHtml: string;
+  leaderboardTextMarkdown: string;
+  playerCount: number;
+  totalCoins: number;
+} {
+  const liveDb = loadDatabase();
+  const database = db || liveDb;
+  const addedAny = syncAuthorizedProfilesToDb(database);
+  if (addedAny && (!db || database === liveDb)) {
+    saveDatabase(database);
+  }
+  const profiles = (Object.values(database.profiles || {}) as UserProfileData[]).filter(Boolean);
 
   // 按筹码余额由高到低降序排列
-  profiles.sort((a, b) => (b.coins || 0) - (a.coins || 0));
+  profiles.sort((a, b) => (b.coins || 0) - (a.coins || 0) || (b.updatedAt || 0) - (a.updatedAt || 0));
 
   const totalCoins = profiles.reduce((sum, u) => sum + (u.coins || 0), 0);
-  const now = new Date();
-  const timeStr = now.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-  const dateTag = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`;
+  const { timeStr, dateTag } = getShanghaiDateParts();
   const fileName = `茶楼玩家积分全量备份_${dateTag}.txt`;
   const safeFileName = `Teahouse_Players_Backup_${dateTag}.txt`;
 
@@ -127,10 +164,11 @@ export function exportPlayersPointsTxt(db?: any): { txtContent: string; fileName
     txt += `(暂无注册玩家资料)\r\n`;
   } else {
     profiles.forEach((p, idx) => {
-      const pPhone = String(p.phone || '').trim() || '未绑定';
+      const pPhone = normalizePhone(p.phone || p.username || '') || String(p.phone || '').trim() || '未绑定';
+      const safeTxtName = String(p.name || '无名茶客').replace(/[|\r\n]+/g, ' ').trim() || '无名茶客';
       const statusStr = p.isBanned ? '已封禁' : '正常';
       const lastActive = p.updatedAt ? new Date(p.updatedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '无活跃记录';
-      txt += `${String(idx + 1).padStart(2, ' ')}. | ${p.id} | ${pPhone} | ${p.name || '无名茶客'} | ${(p.coins || 0).toLocaleString()} | Lv.${p.level || 1} | ${statusStr} | ${lastActive}\r\n`;
+      txt += `${String(idx + 1).padStart(2, ' ')}. | ${p.id} | ${pPhone} | ${safeTxtName} | ${(p.coins || 0).toLocaleString()} | Lv.${p.level || 1} | ${statusStr} | ${lastActive}\r\n`;
     });
   }
 
@@ -150,13 +188,54 @@ export function exportPlayersPointsTxt(db?: any): { txtContent: string; fileName
     `• 🪙 <b>全服筹码总额</b>: <b>${totalCoins.toLocaleString()}</b> 分\n` +
     `• 💾 <b>灾备说明</b>: 已自动生成 TXT 榜单附件，便于 Termux 设备故障时秒级重组加积分还原！`;
 
-  return { txtContent, fileName, safeFileName, summaryTextHtml };
+  let md = `📄 *【全服玩家积分 TXT 榜单】*\n\n` +
+    `• 🕒 *备份时刻*: \`${timeStr}\`\n` +
+    `• 👥 *注册玩家总数*: *${profiles.length}* 人\n` +
+    `• 🪙 *全服筹码总额*: *${totalCoins.toLocaleString()}* 分\n\n` +
+    `🏆 *玩家积分排行榜*:\n`;
+
+  if (profiles.length === 0) {
+    md += `• (暂无注册玩家资料，可在 Bot 中直接发送手机号授权建档)\n`;
+  } else {
+    let shown = 0;
+    const maxShow = 35;
+    for (let i = 0; i < profiles.length && shown < maxShow; i++) {
+      const p = profiles[i];
+      const pPhone = normalizePhone(p.phone || p.username || '') || String(p.phone || '').trim() || '未绑';
+      const safeName = sanitizeMarkdownText(p.name || '无名茶客') || '无名茶客';
+      const statusBadge = p.isBanned ? '🚫已封禁' : (p.password ? '🟢已激活' : '📱待首登');
+      const line = `${i + 1}. ${p.avatar || '👤'} *${safeName}* (📱 \`${pPhone}\`) — 🪙 *${(p.coins || 0).toLocaleString()}* 分 | Lv.${p.level || 1} · ${statusBadge}${p.isAdmin ? ' 👑' : ''}\n`;
+      if (md.length + line.length > 3600) {
+        break;
+      }
+      md += line;
+      shown++;
+    }
+    if (profiles.length > shown) {
+      md += `\n... 还有 *${profiles.length - shown}* 位玩家未完整展开，完整数据详见随附 TXT 榜单文件。\n`;
+    }
+  }
+
+  return {
+    txtContent,
+    fileName,
+    safeFileName,
+    summaryTextHtml,
+    leaderboardTextMarkdown: md.trimEnd(),
+    playerCount: profiles.length,
+    totalCoins,
+  };
 }
 
 /**
  * 将最新的全量玩家积分 TXT 榜单以 sendDocument 附件形式推送给 Telegram 管理员
  */
-export async function notifyPointsTxtToTelegram(reason: string, db?: any, targetChatId?: string | number): Promise<boolean> {
+export async function notifyPointsTxtToTelegram(
+  reason: string,
+  db?: any,
+  targetChatId?: string | number,
+  options?: { timeoutMs?: number }
+): Promise<boolean> {
   const { refreshEnvFromDisk, getTelegramApiBase } = await import('../telegramBotService.ts');
   refreshEnvFromDisk();
   const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/^['"]+|['"]+$/g, '');
@@ -166,16 +245,18 @@ export async function notifyPointsTxtToTelegram(reason: string, db?: any, target
     return false;
   }
 
+  const timeoutMs = Math.max(2000, options?.timeoutMs || 15000);
+
   try {
     const database = db || loadDatabase();
-    const { txtContent, safeFileName, summaryTextHtml } = exportPlayersPointsTxt(database);
+    const { txtContent, safeFileName, summaryTextHtml, playerCount } = exportPlayersPointsTxt(database);
     const apiBase = getTelegramApiBase();
 
-    const captionHtml = `${summaryTextHtml}\n\n📌 <b>数据变动来源</b>: ${escapeHtml(reason)}`;
+    const rawCaptionHtml = `${summaryTextHtml}\n\n📌 <b>数据变动来源</b>: ${escapeHtml(reason)}`;
+    const captionHtml = rawCaptionHtml.length > 1000 ? rawCaptionHtml.slice(0, 997) + '...' : rawCaptionHtml;
 
-    // 使用纯正的 Uint8Array 提取 Buffer 字节流，规避 Node.js Buffer 内存池 offset 偏移导致 undici Blob 字节损坏错位
     const rawBuffer = Buffer.from(txtContent, 'utf-8');
-    const isolatedBytes = new Uint8Array(rawBuffer.buffer, rawBuffer.byteOffset, rawBuffer.byteLength);
+    const isolatedBytes = new Uint8Array(rawBuffer);
 
     const formData = new FormData();
     formData.append('chat_id', String(chatId));
@@ -187,7 +268,7 @@ export async function notifyPointsTxtToTelegram(reason: string, db?: any, target
     const res = await fetch(`${apiBase}/bot${botToken}/sendDocument`, {
       method: 'POST',
       body: formData,
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
 
     const resData = (await res.json().catch(() => ({}))) as any;
@@ -195,7 +276,9 @@ export async function notifyPointsTxtToTelegram(reason: string, db?: any, target
       console.log(`✅ [Points Backup TXT] 成功发送 TXT 备份文档附件给 Telegram (chatId: ${chatId}): ${safeFileName} (${reason})`);
       return true;
     } else {
-      const plainCaption = `📄 【全服玩家积分 TXT 备份】\n备份时间: ${new Date().toLocaleString('zh-CN')}\n玩家总数: ${Object.keys(database.profiles || {}).length}\n变动原因: ${reason}`;
+      console.warn(`⚠️ [Points Backup TXT] HTML caption sendDocument 未通过 (${resData?.description || res.status})，尝试纯文本重试...`);
+      const rawPlain = `📄 【全服玩家积分 TXT 备份】\n备份时间: ${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })}\n玩家总数: ${playerCount}\n变动原因: ${reason}`;
+      const plainCaption = rawPlain.length > 1000 ? rawPlain.slice(0, 997) + '...' : rawPlain;
       const plainFormData = new FormData();
       plainFormData.append('chat_id', String(chatId));
       plainFormData.append('document', blob, safeFileName);
@@ -203,14 +286,14 @@ export async function notifyPointsTxtToTelegram(reason: string, db?: any, target
       const retryRes = await fetch(`${apiBase}/bot${botToken}/sendDocument`, {
         method: 'POST',
         body: plainFormData,
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(timeoutMs),
       });
       const retryData = (await retryRes.json().catch(() => ({}))) as any;
       if (retryData?.ok) {
         console.log(`✅ [Points Backup TXT] 纯文本降级成功发送 TXT 备份附件给 Telegram (chatId: ${chatId})`);
         return true;
       }
-      console.warn(`⚠️ [Points Backup TXT] Telegram sendDocument 响应非 OK:`, resData?.description || resData);
+      console.warn(`⚠️ [Points Backup TXT] Telegram sendDocument 响应非 OK:`, retryData?.description || resData?.description || resData);
       return false;
     }
   } catch (err: any) {
@@ -667,54 +750,71 @@ export async function executeTelegramUpdate(
       rawText = `/authphone ${targetPhone}`;
     }
     adminPendingStates.delete(senderKey);
-  } else if (activePending?.action === 'broadcast' && !trimmed.startsWith('/')) {
-    rawText = `/broadcast ${trimmed}`;
-    adminPendingStates.delete(senderKey);
   } else if (/^(?:🔍\s*)?(?:输入手机号搜索玩家|搜手机号查玩家|手机号搜索玩家|搜索玩家|查手机号|搜手机号|查用户|搜索用户|查找玩家|查手机|findphone|searchphone|finduser)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:🔍\s*)?(?:输入手机号搜索玩家|搜手机号查玩家|手机号搜索玩家|搜索玩家|查手机号|搜手机号|查用户|搜索用户|查找玩家|查手机|findphone|searchphone|finduser)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/findphone ${m[1].trim()}` : '/findphone';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:🧹\s*)?(?:清空所有用户|清空用户|清理所有用户|清空全部茶客|清空茶客|clearusers|cleanusers)$/i.test(trimmed)) {
     rawText = '/clearusers';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:❌\s*)?(?:删除用户|注销用户|清理用户|deluser|removeuser)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:❌\s*)?(?:删除用户|注销用户|清理用户|deluser|removeuser)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/deluser ${m[1].trim()}` : '/deluser';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:🗑️\s*)?(?:删除手机号|移出手机号|删除手机|移除手机号|移除手机|移出白名单|删除白名单|delphone|removephone)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:🗑️\s*)?(?:删除手机号|移出手机号|删除手机|移除手机号|移除手机|移出白名单|删除白名单|delphone|removephone)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/delphone ${m[1].trim()}` : '/delphone';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:📱\s*)?(?:授权手机号|添加手机号|增加手机号|添加白名单|authphone|addphone|授权|加白)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:📱\s*)?(?:授权手机号|添加手机号|增加手机号|添加白名单|authphone|addphone|授权|加白)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/authphone ${m[1].trim()}` : '/authphone';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:➕\s*)?(?:注入筹码|增加筹码|加筹码|充值|addpoints|加币|加分)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:➕\s*)?(?:注入筹码|增加筹码|加筹码|充值|addpoints|加币|加分)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/addpoints ${m[1].trim()}` : '/addpoints';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:➖\s*)?(?:扣除筹码|扣减筹码|减筹码|扣分|subpoints|减币|扣币)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:➖\s*)?(?:扣除筹码|扣减筹码|减筹码|扣分|subpoints|减币|扣币)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/subpoints ${m[1].trim()}` : '/subpoints';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:⚙️\s*)?(?:重设筹码|设定筹码|重置筹码|改筹码|setpoints)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:⚙️\s*)?(?:重设筹码|设定筹码|重置筹码|改筹码|setpoints)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/setpoints ${m[1].trim()}` : '/setpoints';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:📢\s*)?(?:全服广播|发布广播|全服通告|广播|broadcast)(?:\s+(.+))?$/i.test(trimmed)) {
     const m = trimmed.match(/^(?:📢\s*)?(?:全服广播|发布广播|全服通告|广播|broadcast)(?:\s+(.+))?$/i);
     rawText = m && m[1] ? `/broadcast ${m[1].trim()}` : '/broadcast';
+    adminPendingStates.delete(senderKey);
   } else if (/^(?:📄\s*)?(?:玩家积分TXT榜单|玩家积分TXT|玩家积分榜|积分榜单|TXT榜单|导出积分|积分导出|txt|exporttxt)(?:\s+(.+))?$/i.test(trimmed)) {
     rawText = '/exporttxt';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '👥 玩家名册' || trimmed.includes('玩家名册') || trimmed.includes('查看玩家') || trimmed === '用户列表') {
     rawText = '/users';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '📊 运营统计' || trimmed.includes('运营统计')) {
     rawText = '/stats';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '⚡ 匹配池监控' || trimmed.includes('匹配池') || trimmed.includes('匹配监控')) {
     rawText = '/matchpool';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '📋 白名单列表' || trimmed.includes('白名单列表') || trimmed.includes('授权列表') || trimmed === '白名单') {
     rawText = '/whitelist';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '🀄 牌桌巡视' || trimmed.includes('牌桌巡视') || trimmed.includes('巡视牌桌')) {
     rawText = '/rooms';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '📜 审计日志' || trimmed.includes('审计日志') || trimmed.includes('操作日志')) {
     rawText = '/logs';
+    adminPendingStates.delete(senderKey);
   } else if (trimmed === '❓ 帮助菜单' || trimmed.includes('帮助') || trimmed.includes('菜单') || trimmed.includes('指南')) {
     rawText = '/help';
+    adminPendingStates.delete(senderKey);
+  } else if (activePending?.action === 'broadcast' && !trimmed.startsWith('/')) {
+    rawText = `/broadcast ${trimmed}`;
+    adminPendingStates.delete(senderKey);
   }
   const parts = rawText.trim().split(/\s+/);
-  const cmd = (parts[0] || '').toLowerCase();
+  const cmd = (parts[0] || '').toLowerCase().replace(/@[a-z0-9_]+$/i, '');
   const arg1 = parts[1] || '';
   const arg2 = parts[2] || '';
 
@@ -749,9 +849,18 @@ export async function executeTelegramUpdate(
       if (chatId) {
         storeAdminChatId(chatId);
       }
-      notifyPointsTxtToTelegram('管理员手动导出玩家积分TXT榜单', db, chatId).catch(() => {});
-      const { summaryTextHtml } = exportPlayersPointsTxt(db);
-      reply = `${summaryTextHtml}\n\n📄 *已为您实时生成全量玩家积分 TXT 榜单，并作为文件附件推送到当前 Telegram 会话中！*\n（可随时用于 Termux 硬件故障报废时的全量还原）`;
+      const { leaderboardTextMarkdown } = exportPlayersPointsTxt(db);
+      const hasToken = Boolean((process.env.TELEGRAM_BOT_TOKEN || '').trim().replace(/^['"]+|['"]+$/g, ''));
+      let docSent = false;
+      if (chatId && hasToken) {
+        docSent = await notifyPointsTxtToTelegram('管理员手动导出玩家积分TXT榜单', db, chatId, { timeoutMs: 6000 }).catch(() => false);
+      }
+      const footer = docSent
+        ? `\n\n📄 *已同步将完整 TXT 榜单文件附件推送到当前 Telegram 会话中！*\n（可随时用于 Termux 硬件故障报废时的全量还原）`
+        : (!chatId || !hasToken)
+          ? `\n\n💡 _当前未配置主动推送文件通道，上方已完整展示玩家积分榜单。_`
+          : `\n\n⚠️ _上方已完整展示玩家积分榜单；TXT 文件附件推送超时或受网络限制，请检查反代配置或通过管理端导出下载。_`;
+      reply = `${leaderboardTextMarkdown}${footer}`;
       break;
     }
 
@@ -849,19 +958,7 @@ export async function executeTelegramUpdate(
     }
 
     case '/users': {
-      const { allowedPhones, adminPhones } = getAllowedAndAdminPhones();
-      const allAuthPhones = Array.from(new Set([...allowedPhones, ...adminPhones]));
-      let addedAny = false;
-      for (const ap of allAuthPhones) {
-        if (ap && ap.length >= 5) {
-          const found = findUser(ap, db);
-          if (!found) {
-            ensureUserProfile(ap, db, 0);
-            addedAny = true;
-          }
-        }
-      }
-      if (addedAny) {
+      if (syncAuthorizedProfilesToDb(db)) {
         saveDatabase(db);
       }
 

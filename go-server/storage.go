@@ -495,6 +495,24 @@ func (s *StorageManager) ensureUserProfile(phone string, db *DatabaseSchema, ini
 	return prof
 }
 
+func (s *StorageManager) syncAuthorizedProfilesLocked(db *DatabaseSchema) bool {
+	if db == nil {
+		return false
+	}
+	if db.Profiles == nil {
+		db.Profiles = map[string]*UserProfile{}
+	}
+	allowedPhones, adminPhones := s.getAllowedAndAdminPhones(db)
+	added := false
+	for _, ap := range append(allowedPhones, adminPhones...) {
+		if len(ap) >= 5 && findUserInDB(ap, db) == nil {
+			s.ensureUserProfile(ap, db, 0)
+			added = true
+		}
+	}
+	return added
+}
+
 func recordServerPointsTx(db *DatabaseSchema, userID, txType, title string, amount, balanceAfter int) {
 	if db.PointsLedger == nil {
 		db.PointsLedger = map[string][]PointsTx{}

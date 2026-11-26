@@ -2002,9 +2002,12 @@ func setupRoutes(h *Hub, tm *TelegramManager) http.Handler {
 	}))
 
 	handleExportPointsTxt := withAdmin(func(w http.ResponseWriter, r *http.Request) {
-		var snap *DatabaseSchema
-		h.storage.WithDBRead(func(db *DatabaseSchema) { snap = db })
-		exp := exportPlayersPointsTxt(snap)
+		var exp exportedPointsTxt
+		_ = h.storage.WithDBWrite(func(db *DatabaseSchema) bool {
+			changed := h.storage.syncAuthorizedProfilesLocked(db)
+			exp = exportPlayersPointsTxt(db)
+			return changed
+		})
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, exp.SafeFileName, url.QueryEscape(exp.FileName)))
 		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -2145,6 +2148,9 @@ func setupRoutes(h *Hub, tm *TelegramManager) http.Handler {
 					}
 				}
 				db.RevokedPhones = kept
+				if len(p) >= 5 {
+					h.storage.ensureUserProfile(p, db, 0)
+				}
 			}
 			appendAdminLog(db, "WHITELIST_ADD", operator, strings.Join(added, ", "),
 				fmt.Sprintf("将 %d 个手机号加入 Telegram 授权白名单: %s", len(added), strings.Join(added, ", ")), 0)

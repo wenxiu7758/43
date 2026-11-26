@@ -57,6 +57,11 @@ import {
   SceneWaitingRoom,
 } from '../src/server/realtimeTypes.ts';
 import { presenceTracker } from '../src/presenceTracker.ts';
+import {
+  exportPlayersPointsTxt,
+  executeTelegramUpdate,
+} from '../src/server/telegramAdminHandlers.ts';
+import { loadDatabase } from '../src/serverStorage.ts';
 
 function yCard(rank: number, suit: '♠' | '♥' | '♣' | '♦'): YansanCard {
   const suitVal = suit === '♠' ? 4 : suit === '♥' ? 3 : suit === '♣' ? 2 : 1;
@@ -1357,10 +1362,118 @@ function runServerEngineRegressionTests() {
   assert.equal(mjBotClaimRoom.deal.seatCards[2].length, 10, 'Bot seat 2 must have 10 tiles remaining after Peng + discard');
 }
 
-runYansanTests();
-runShisanshuiTests();
-runMahjongTests();
-runSanitizerTests();
-runRealtimeHubTests();
-runServerEngineRegressionTests();
-console.log('✅ All rule engine regression tests passed (Yansan, Shisanshui, Booking, Mahjong, Sanitizers, RealtimeHub, ServerEngines).');
+async function runTelegramExportTests() {
+  // 1. exportPlayersPointsTxt must sync authorizedPhones without profiles, exclude revokedPhones, and emit both TXT rows and Markdown leaderboard
+  const mockDb: any = {
+    authorizedPhones: ['13900001111', '13900009999'],
+    adminPhones: [],
+    revokedPhones: ['13900009999'],
+    profiles: {
+      'USER-1001': {
+        id: 'USER-1001',
+        name: '雀神*测试|号',
+        username: '13900002222',
+        phone: '13900002222',
+        avatar: '👑',
+        coins: 58000,
+        rating: 2100,
+        level: 4,
+        password: 'hashed_pw',
+        isAdmin: false,
+        isBanned: false,
+        lastCheckinDate: '',
+        stats: {},
+        updatedAt: Date.now(),
+      },
+      'USER-1002': {
+        id: 'USER-1002',
+        name: '二号茶客',
+        username: '13900003333',
+        phone: '13900003333',
+        avatar: '🍵',
+        coins: 12000,
+        rating: 1850,
+        level: 2,
+        password: '',
+        isAdmin: true,
+        isBanned: false,
+        lastCheckinDate: '',
+        stats: {},
+        updatedAt: Date.now() - 10000,
+      },
+    },
+    records: [],
+    adminLogs: [],
+    systemAnnouncements: [],
+  };
+
+  const exported = exportPlayersPointsTxt(mockDb);
+  assert.equal(exported.playerCount, 3, 'exportPlayersPointsTxt must include existing profiles plus missing authorizedPhones (excluding revoked)');
+  assert.equal(exported.totalCoins, 70000);
+  assert(exported.txtContent.startsWith('\uFEFF'), 'TXT output must start with UTF-8 BOM');
+  assert(exported.txtContent.includes('13900002222') && exported.txtContent.includes('58,000'), 'TXT must include top player');
+  assert(exported.txtContent.includes('13900001111'), 'TXT must include pre-synced authorized phone');
+  assert(!exported.txtContent.includes('13900009999'), 'TXT must exclude revoked phone');
+  assert(exported.leaderboardTextMarkdown.includes('雀神测试｜号') || exported.leaderboardTextMarkdown.includes('雀神测试|号'), 'Markdown leaderboard must include sanitized player name');
+  assert(exported.leaderboardTextMarkdown.includes('13900002222') && exported.leaderboardTextMarkdown.includes('58,000'));
+  assert(exported.leaderboardTextMarkdown.includes('13900001111'));
+  assert(!exported.leaderboardTextMarkdown.includes('<b>') && !exported.leaderboardTextMarkdown.includes('<code>'), 'Markdown leaderboard must not contain raw HTML tags');
+
+  // 2. executeTelegramUpdate for 📄 玩家积分TXT榜单 and /exporttxt@Bot even after 📢 全服广播 pending state
+  const liveDb = loadDatabase();
+  const prevProfileKeys = new Set(Object.keys(liveDb.profiles || {}));
+  liveDb.profiles['USER-TG-TEST'] = {
+    id: 'USER-TG-TEST',
+    name: '榜单测试员',
+    username: '13900007777',
+    phone: '13900007777',
+    avatar: '🀄',
+    coins: 99999,
+    rating: 2000,
+    level: 3,
+    password: 'pw',
+    lastCheckinDate: '',
+    stats: {
+      yansan: { played: 0, won: 0, highestScore: 0 },
+      shisanshui: { played: 0, won: 0, highestScore: 0 },
+      mahjong: { played: 0, won: 0, highestScore: 0 },
+    },
+    updatedAt: Date.now(),
+  };
+
+  try {
+    // Enter pending broadcast state, then immediately tap 📄 玩家积分TXT榜单 -> must route to /exporttxt, NOT broadcast
+    const pendingRes = await executeTelegramUpdate({ command: '📢 全服广播', operator: 'test_admin' }, undefined, { isWebhook: true });
+    assert.equal(pendingRes.command, '/broadcast');
+
+    const btnRes = await executeTelegramUpdate({ message: { text: '📄 玩家积分TXT榜单', chat: { id: 0 }, from: { id: 0 } } }, undefined, { isWebhook: true });
+    assert.equal(btnRes.command, '/exporttxt', 'Clicking 📄 玩家积分TXT榜单 must not be hijacked by pending broadcast state');
+    assert(btnRes.reply.includes('榜单测试员') && btnRes.reply.includes('13900007777') && btnRes.reply.includes('99,999'), 'Telegram reply must display player data directly');
+    assert(!btnRes.reply.includes('<b>') && !btnRes.reply.includes('<code>'), 'Telegram reply must not contain raw HTML tags');
+
+    const botCmdRes = await executeTelegramUpdate({ command: '/exporttxt@TeahouseTestBot', operator: 'test_admin' }, undefined, { isWebhook: true });
+    assert(botCmdRes.reply.includes('榜单测试员') && botCmdRes.reply.includes('99,999'), '/exporttxt@BotName must also display player data');
+  } finally {
+    for (const k of Object.keys(liveDb.profiles || {})) {
+      if (!prevProfileKeys.has(k)) {
+        delete liveDb.profiles[k];
+      }
+    }
+  }
+}
+
+async function runAll() {
+  runYansanTests();
+  runShisanshuiTests();
+  runMahjongTests();
+  runSanitizerTests();
+  runRealtimeHubTests();
+  runServerEngineRegressionTests();
+  await runTelegramExportTests();
+  console.log('✅ All rule engine regression tests passed (Yansan, Shisanshui, Booking, Mahjong, Sanitizers, RealtimeHub, ServerEngines, TelegramExport).');
+}
+
+runAll().catch((err) => {
+  console.error('❌ Verification failed:', err);
+  process.exit(1);
+});
