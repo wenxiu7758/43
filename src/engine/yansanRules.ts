@@ -1325,43 +1325,77 @@ export function getYansanSmartAIPlay(
       };
     }
 
-    // 1. 首出必须带方块4 (♦4)：优先按最优拆牌组合一起顺走
+    // 0.5 准两步强势收官：若最优拆牌仅剩2手且其中一手是 3 或 四带一/同花顺 控场（且非首出），优先抢控场手
+    if (!isFirstTurn && optPart.turnCount === 2) {
+      const strongLead = optPart.combos.find((cb) => {
+        const p = parseYansanCombo(cb);
+        if (!p) return false;
+        return p.rank === 3 || (p.type === '5_card' && (p.comboTier || 1) >= 4);
+      }) || optPart.singles.find((c) => c.rank === 3);
+      if (strongLead) {
+        const strongCards = Array.isArray(strongLead) ? strongLead : [strongLead];
+        const rmIds = new Set(strongCards.map((c) => c.id));
+        const remHand = sorted.filter((c) => !rmIds.has(c.id));
+        const remParsed = parseYansanCombo(remHand);
+        if (remParsed) {
+          const p = parseYansanCombo(strongCards)!;
+          return {
+            cards: strongCards,
+            thought: `【二步收官】先手打出强控牌【${p.label}】夺定主动权，下一手即可顺利清盘！`,
+            tacticalIntent: 'win_clear',
+            deducedAlliances: beliefs,
+          };
+        }
+      }
+    }
+
+    // 1. 首出必须带方块4 (♦4)：从所有含♦4的合法组合中挑选使剩余手牌手数最少且不浪费2/3的最佳开局
     if (isFirstTurn) {
       const diamond4 = sorted.find((c) => c.rank === 4 && c.suit === '♦');
       if (diamond4) {
-        // 优先从最优拆法中找到包含 ♦4 的多张组合（如顺子、同花、四带一、对4、三条4）
-        const optWithD4 = optPart.combos.find((cb) => cb.some((c) => c.id === diamond4.id));
-        if (optWithD4) {
-          const p = parseYansanCombo(optWithD4);
-          return {
-            cards: optWithD4,
-            thought: `首出方块4，顺势打出【${p?.label || '组合牌'}】消减手牌并保持最优牌型`,
-            tacticalIntent: 'first_turn_d4',
-            deducedAlliances: beliefs,
-          };
+        const d4Candidates: YansanCard[][] = [[diamond4]];
+        for (const cb of optPart.combos) {
+          if (cb.some((c) => c.id === diamond4.id)) d4Candidates.push(cb);
         }
-        for (const st of decomp.straights) {
-          if (st.some((c) => c.id === diamond4.id)) {
-            return {
-              cards: st,
-              thought: '首出方块4，顺势甩出5张连贯顺子占尽先机',
-              tacticalIntent: 'first_turn_d4',
-              deducedAlliances: beliefs,
-            };
-          }
+        for (const c5 of decomp.all5CardCombos) {
+          if (c5.some((c) => c.id === diamond4.id)) d4Candidates.push(c5);
         }
         const fours = sorted.filter((c) => c.rank === 4);
-        if (fours.length >= 2) {
-          return {
-            cards: fours.length >= 3 ? fours.slice(0, 3) : fours,
-            thought: '首出方块4，出对4/三条4起步',
-            tacticalIntent: 'first_turn_d4',
-            deducedAlliances: beliefs,
-          };
+        if (fours.length >= 2) d4Candidates.push(fours.slice(0, 2));
+        if (fours.length >= 3) d4Candidates.push(fours.slice(0, 3));
+
+        let bestD4Cards = d4Candidates[0];
+        let bestD4Score = -999999;
+        for (const cand of d4Candidates) {
+          const parsed = parseYansanCombo(cand);
+          if (!parsed) continue;
+          const rmIds = new Set(cand.map((c) => c.id));
+          const rem = sorted.filter((c) => !rmIds.has(c.id));
+          const remPart = partitionYansanHandOptimal(rem, availablePool, maxOpponentHandSize);
+          let sc = (cand.length > 1 ? 30 : 0) - remPart.cost * 12;
+          if (parsed.type === '5_card' && (parsed.comboTier || 1) <= 2) {
+            // 避免白白把 2 / 3 / ♠A 塞进低阶顺子/同花
+            const wastedControls = cand.filter((c) => getYansanRankWeight(c.rank) >= 12 || (c.rank === 14 && c.suit === '♠')).length;
+            sc -= wastedControls * 25;
+            sc += 18;
+          } else if (parsed.type === '5_card' && (parsed.comboTier || 1) >= 4) {
+            sc -= 35; // 首手不轻易交炸弹除非唯一且可清空
+          } else if (parsed.type === 'triplet') {
+            sc += 14;
+          } else if (parsed.type === 'pair') {
+            sc += 10;
+          }
+          if (sc > bestD4Score) {
+            bestD4Score = sc;
+            bestD4Cards = cand;
+          }
         }
+        const p = parseYansanCombo(bestD4Cards);
         return {
-          cards: [diamond4],
-          thought: '首出打出底牌方块4试探全局',
+          cards: bestD4Cards,
+          thought: bestD4Cards.length > 1
+            ? `首出方块4，优选【${p?.label || '组合牌'}】消减手牌并保持最优剩余结构`
+            : '首出打出底牌方块4试探全局，保留大牌与整牌结构',
           tacticalIntent: 'first_turn_d4',
           deducedAlliances: beliefs,
         };
@@ -1445,12 +1479,22 @@ export function getYansanSmartAIPlay(
         };
       }
       if (optPart.singles.length > 0) {
-        // 若单张走低会送给下家，尽量出中等单张；否则出最低孤张迫使对手拆对
-        const lowSingle = optPart.singles[0];
+        const safeSingle = optPart.singles.find((c) => getYansanRankWeight(c.rank) <= 9) || optPart.singles[0];
         return {
-          cards: [lowSingle],
-          thought: `【拆解敌对】打出孤张${lowSingle.label}逼迫仅余2张牌的对手拆牌`,
+          cards: [safeSingle],
+          thought: `【拆解敌对】打出单张${safeSingle.label}逼迫仅余2张牌的对手拆对`,
           tacticalIntent: 'lead_singleton',
+          deducedAlliances: beliefs,
+        };
+      }
+      // 仅有大对子可领出：出最大对子压死 2 张对手
+      const optPairsDesc = optPart.combos.filter((cb) => cb.length === 2).reverse();
+      if (optPairsDesc.length > 0) {
+        const topPair = optPairsDesc[0];
+        return {
+          cards: topPair,
+          thought: `【顶大对封堵】对手仅余2张，打出高对${topPair[0].label}强压封口！`,
+          tacticalIntent: 'block_enemy',
           deducedAlliances: beliefs,
         };
       }
@@ -1461,7 +1505,6 @@ export function getYansanSmartAIPlay(
     for (const cb of optPart.combos) {
       const parsed = parseYansanCombo(cb);
       if (parsed && isYansanComboDeductivelyUnbeatable(parsed, availablePool, maxOpponentHandSize)) {
-        // 但如果本身只剩这手+一手，已在上方 winSeqCombo 处理；多手时若因对手张数不足而绝大，先白嫖甩出！
         const needed = parsed.type === '5_card' ? 5 : parsed.type === 'triplet' ? 3 : parsed.type === 'pair' ? 2 : 1;
         if (maxOpponentHandSize < needed) {
           return {
@@ -1499,13 +1542,13 @@ export function getYansanSmartAIPlay(
       };
     }
 
-    // 挑选最优非控制小组合：低三条(<=Q) / 低对子(<=J) / 弱散牌(<=10) 比较谁更小更安全
-    const lowTriplet = optPart.combos.find((cb) => cb.length === 3 && getYansanRankWeight(cb[0].rank) <= 9);
-    const lowPair = optPart.combos.find((cb) => cb.length === 2 && getYansanRankWeight(cb[0].rank) <= 8);
-    const lowSingle = optPart.singles.find((c) => getYansanRankWeight(c.rank) <= 7);
+    // 挑选最优非控制小组合：低三条(<=K) / 低对子(<=Q) / 弱散牌(<=J)
+    const lowTriplet = optPart.combos.find((cb) => cb.length === 3 && getYansanRankWeight(cb[0].rank) <= 10);
+    const lowPair = optPart.combos.find((cb) => cb.length === 2 && getYansanRankWeight(cb[0].rank) <= 9);
+    const lowSingle = optPart.singles.find((c) => getYansanRankWeight(c.rank) <= 8);
 
-    // 若手里弱散牌较多(>=3张)且有小单张(<=8)，且下家不是极低手牌敌人，先清理小孤张，不轻易用中大对子消耗
-    if (lowSingle && (optPart.singles.length >= 3 || !lowPair) && !(isDownstreamEnemyOrUnknown && downstreamCards <= 3)) {
+    // 若手里弱散牌较多(>=2张)且下家不是极低手牌敌人，先清理小孤张，不轻易用中大对子消耗
+    if (lowSingle && (optPart.singles.length >= 2 || !lowPair) && !(isDownstreamEnemyOrUnknown && downstreamCards <= 3)) {
       return {
         cards: [lowSingle],
         thought: `清理低阶孤张${lowSingle.label}，保护整牌结构与高位控制张`,
@@ -1548,8 +1591,10 @@ export function getYansanSmartAIPlay(
       };
     }
 
-    // 若非控制单张存在，先走非控制单张
-    const nonControlSingle = optPart.singles.find((c) => !isYansanControlCard(c));
+    // 若非控制单张存在，先走非控制单张（若下家敌人<=3张则尽量走中高单张）
+    const nonControlSingle = isDownstreamEnemyOrUnknown && downstreamCards <= 3
+      ? [...optPart.singles].reverse().find((c) => !isYansanControlCard(c))
+      : optPart.singles.find((c) => !isYansanControlCard(c));
     if (nonControlSingle) {
       return {
         cards: [nonControlSingle],
@@ -1584,9 +1629,19 @@ export function getYansanSmartAIPlay(
   const isTargetFromAlly = beliefs[targetSeat].score >= 0.45;
   const isTargetFromEnemy = beliefs[targetSeat].score <= -0.2;
 
+  const blockingThreat = {
+    singleDanger:
+      (isDownstreamEnemyOrUnknown && downstreamCards === 1) ||
+      (minNonAllyCards === 1 && !isDownstreamAlly),
+    pairDanger:
+      (isDownstreamEnemyOrUnknown && downstreamCards === 2) ||
+      (minNonAllyCards === 2 && !isDownstreamAlly),
+  };
+
   // 0. 抢赢判胜检查：
   // - 若能直接一击出清 (remHand.length === 0)，立刻出牌获胜；
-  // - 若打出“当前全场绝大”的压制牌夺得绝对牌权，且剩余手牌构成 100% N 步必胜序列，才果断出手锁定胜局！
+  // - 若打出“当前全场绝大”的压制牌夺得绝对牌权，且剩余手牌构成 100% N 步必胜序列，果断出手锁定胜局；
+  // - 若打出强控制牌(3/四带一/同花顺)后仅剩最后一手整牌，直接抢攻收官！
   const allDirectBeats = collectAllLegalBeatingPlays(sorted, target, decomp);
   for (const beatCards of allDirectBeats) {
     const rmIds = new Set(beatCards.map((c) => c.id));
@@ -1613,8 +1668,34 @@ export function getYansanSmartAIPlay(
       };
     }
   }
+  const availableThrees = availablePool.filter((c) => c.rank === 3).length;
+  const targetWorthSnatching =
+    target.type === '5_card' ||
+    getYansanRankWeight(target.rank) >= 9 ||
+    minNonAllyCards <= 4;
+  for (const beatCards of allDirectBeats) {
+    const rmIds = new Set(beatCards.map((c) => c.id));
+    const remHand = sorted.filter((c) => !rmIds.has(c.id));
+    const remCombo = parseYansanCombo(remHand);
+    const beatParsed = parseYansanCombo(beatCards);
+    if (
+      remCombo &&
+      beatParsed &&
+      (targetWorthSnatching || remHand.length <= 2) &&
+      (beatParsed.rank === 3 ||
+        (beatParsed.type === '5_card' && (beatParsed.comboTier || 1) >= 4) ||
+        (beatParsed.rank === 15 && availableThrees <= 1))
+    ) {
+      return {
+        cards: beatCards,
+        thought: `【抢手收官】打出强控牌【${beatParsed.label}】夺权，剩余最后一手即可清空出局！`,
+        tacticalIntent: 'win_clear',
+        deducedAlliances: beliefs,
+      };
+    }
+  }
 
-  // 1. 盟友出牌保送与让行原则（彻底取消随机乱顶，且绝不卡自己盟友下家）
+  // 1. 盟友出牌保送与让行原则（彻底取消随机乱顶，且绝不卡自己盟友下家；但下家敌方报单时需替盟友封顶）
   if (isTargetFromAlly) {
     const targetRW = getYansanRankWeight(target.rank);
     const isTargetAlreadyUnbeatable = isYansanComboDeductivelyUnbeatable(target, availablePool, maxOpponentHandSize);
@@ -1624,6 +1705,35 @@ export function getYansanSmartAIPlay(
       (target.type === 'pair' && targetRW >= 9) ||
       target.type === 'triplet' ||
       (target.type === '5_card' && (target.comboTier || 1) >= 2);
+
+    // 若下家非盟友仅剩1张且盟友出了小单张，必须顶大单替盟友关门！
+    if (
+      target.type === 'single' &&
+      isDownstreamEnemyOrUnknown &&
+      downstreamCards === 1 &&
+      !isTargetAlreadyUnbeatable &&
+      targetRW <= 10
+    ) {
+      const topCover = findMinimumEffectiveBeat(
+        sorted,
+        target,
+        decomp,
+        availablePool,
+        maxOpponentHandSize,
+        true,
+        optPart,
+        { singleDanger: true, pairDanger: false }
+      );
+      if (topCover) {
+        const mc = parseYansanCombo(topCover)!;
+        return {
+          cards: topCover,
+          thought: `【紧急顶门】下家对手已报单，盟友所出${target.label}偏小，果断顶出${mc.label}死守防线！`,
+          tacticalIntent: 'block_enemy',
+          deducedAlliances: beliefs,
+        };
+      }
+    }
 
     // 若桌面本就较大、盟友手牌少(<=4)、或下家还是己方同盟、或桌面已是绝大，直接无条件让行！
     if (isTargetStrong || handsCount[targetSeat] <= 4 || isDownstreamAlly) {
@@ -1635,13 +1745,23 @@ export function getYansanSmartAIPlay(
       };
     }
 
-    // 仅当下家是危险敌方/未知玩家(<=5张)且盟友出了极小牌时，才考虑用“不拆牌的中档单/对”(<=Q)顺便替盟友接风顶死下家
+    // 仅当下家是危险敌方/未知玩家(<=5张)且盟友出了极小牌时，顺便替盟友接风顶死下家
     if (isDownstreamEnemyOrUnknown && downstreamCards <= 5) {
-      const mediumCover = findMinimumEffectiveBeat(sorted, target, decomp, availablePool, maxOpponentHandSize, false, optPart);
+      const mediumCover = findMinimumEffectiveBeat(
+        sorted,
+        target,
+        decomp,
+        availablePool,
+        maxOpponentHandSize,
+        downstreamCards <= 2,
+        optPart,
+        blockingThreat
+      );
       if (mediumCover) {
         const mc = parseYansanCombo(mediumCover);
         const mcRW = getYansanRankWeight(mc?.rank || 15);
-        if (mc && mc.type !== '5_card' && mcRW >= 8 && mcRW <= 10) {
+        const maxAllowRW = downstreamCards <= 2 ? 12 : 10;
+        if (mc && mc.type !== '5_card' && mcRW >= 8 && mcRW <= maxAllowRW) {
           return {
             cards: mediumCover,
             thought: `【接风挡敌】下家【${['本家', '西席', '北席', '东席'][downstream]}】手牌仅剩${downstreamCards}张，替盟友用${mc.label}卡位阻断！`,
@@ -1690,7 +1810,8 @@ export function getYansanSmartAIPlay(
     availablePool,
     maxOpponentHandSize,
     isDesperateSituation,
-    optPart
+    optPart,
+    blockingThreat
   );
 
   if (winningPlay) {
@@ -1801,7 +1922,8 @@ function findMinimumEffectiveBeat(
   availablePool: YansanCard[] = [],
   maxOpponentHandSize: number = 13,
   isEmergency: boolean = false,
-  optPart?: YansanHandPartition
+  optPart?: YansanHandPartition,
+  blockingThreat?: { singleDanger?: boolean; pairDanger?: boolean }
 ): YansanCard[] | null {
   const sorted = [...hand].sort((a, b) => getYansanCardPower(a) - getYansanCardPower(b));
   const rankGroups = new Map<number, YansanCard[]>();
@@ -1813,9 +1935,32 @@ function findMinimumEffectiveBeat(
   // 1. 单张管牌
   if (target.type === 'single') {
     const targetRW = getYansanRankWeight(target.rank);
+
+    // ① 若下家/对手存在 1 张报单极度危险，严禁出小单放水，必须顶大牌封门！
+    if (blockingThreat?.singleDanger) {
+      const legalSingles = sorted.filter((c) => {
+        const cand = parseYansanCombo([c]);
+        return Boolean(cand && canBeatYansanCombo(cand, target));
+      });
+      if (legalSingles.length > 0) {
+        // 先找所有合法单张中最强封杀牌（如有多个全场绝大单张，优先用较小的绝大单保留♠3）
+        const unbeatableSingles = legalSingles.filter((c) => {
+          const p = parseYansanCombo([c]);
+          return p && isYansanComboDeductivelyUnbeatable(p, availablePool, maxOpponentHandSize);
+        });
+        if (unbeatableSingles.length > 0) {
+          return [unbeatableSingles[0]];
+        }
+        // 不拆四张炸弹（除非所有可赢单张都在炸弹内）
+        const nonBombMax = [...legalSingles].reverse().find((c) => (rankGroups.get(c.rank)?.length || 0) < 4);
+        return [nonBombMax || legalSingles[legalSingles.length - 1]];
+      }
+      return null;
+    }
+
     const optSingles = optPart ? optPart.singles : decomp.pureSingletons;
 
-    // ① 优先从最优拆牌的真正散牌中找能管上的最小单张（绝不拆顺子/同花/对子/三条）
+    // ② 优先从最优拆牌的真正散牌中找能管上的最小单张（绝不拆顺子/同花/对子/三条）
     for (const c of optSingles) {
       const cand = parseYansanCombo([c]);
       if (!cand || !canBeatYansanCombo(cand, target)) continue;
@@ -1828,7 +1973,7 @@ function findMinimumEffectiveBeat(
       return [c];
     }
 
-    // ② 若目标是高牌 (>=J) 或处于绝境，允许从 3 张相同点数的组里拆出 1 张（但不拆 4 张炸弹除非紧急）
+    // ③ 若目标是高牌 (>=J) 或处于绝境，允许从 3 张相同点数的组里拆出 1 张（但不拆 4 张炸弹除非紧急）
     if (isEmergency || targetRW >= 8) {
       for (const c of sorted) {
         const cnt = rankGroups.get(c.rank)!.length;
@@ -1843,7 +1988,7 @@ function findMinimumEffectiveBeat(
       }
     }
 
-    // ③ 拆对子（最后手段）：仅在对手大牌(>=K)、敌方告急或手牌极少时才允许拆对；绝不平时拆对2/对3/对A打小牌
+    // ④ 拆对子（最后手段）：仅在对手大牌(>=K)、敌方告急或手牌极少时才允许拆对；绝不平时拆对2/对3/对A打小牌
     const pairCount = Array.from(rankGroups.values()).filter((g) => g.length === 2).length;
     const isTargetHigh = targetRW >= 10; // >= K
     if (isEmergency || sorted.length <= 3 || (isTargetHigh && pairCount >= 2)) {
@@ -1864,6 +2009,22 @@ function findMinimumEffectiveBeat(
     const targetRW = getYansanRankWeight(target.rank);
     const optPairs = (optPart?.combos || []).filter((cb) => cb.length === 2);
     const pairPool = [...optPairs, ...decomp.pairs];
+
+    // 对手剩 2 张防对子走脱：顶最高合法对子封堵！
+    if (blockingThreat?.pairDanger && pairPool.length > 0) {
+      const legalPairs = pairPool.filter((p) => {
+        const cand = parseYansanCombo(p);
+        return Boolean(cand && canBeatYansanCombo(cand, target));
+      });
+      if (legalPairs.length > 0) {
+        legalPairs.sort((a, b) => {
+          const ca = parseYansanCombo(a)!;
+          const cb = parseYansanCombo(b)!;
+          return getYansanRankWeight(cb.rank) - getYansanRankWeight(ca.rank) || (cb.suitVal || 0) - (ca.suitVal || 0);
+        });
+        return legalPairs[0];
+      }
+    }
 
     for (const p of pairPool) {
       const cand = parseYansanCombo(p);
@@ -1922,17 +2083,22 @@ function findMinimumEffectiveBeat(
     return null;
   }
 
-  // 4. 5张牌型管牌（按代价升序，避免轻易拿同花顺/四带一接小顺子）
+  // 4. 5张牌型管牌（优先不破坏 optPart 最优拆牌结构，按代价升序，避免轻易拿同花顺/四带一接小顺子）
   if (target.type === '5_card') {
-    const winning5s: YansanCard[][] = [];
-    for (const c5 of decomp.all5CardCombos) {
-      const cand = parseYansanCombo(c5);
-      if (cand && canBeatYansanCombo(cand, target)) {
-        winning5s.push(c5);
-      }
-    }
-    if (winning5s.length > 0) {
-      winning5s.sort((a, b) => {
+    const opt5s = (optPart?.combos || []).filter((cb) => {
+      if (cb.length !== 5) return false;
+      const cand = parseYansanCombo(cb);
+      return Boolean(cand && canBeatYansanCombo(cand, target));
+    });
+    const fallback5s = opt5s.length > 0
+      ? opt5s
+      : decomp.all5CardCombos.filter((c5) => {
+          const cand = parseYansanCombo(c5);
+          return Boolean(cand && canBeatYansanCombo(cand, target));
+        });
+
+    if (fallback5s.length > 0) {
+      fallback5s.sort((a, b) => {
         const ca = parseYansanCombo(a)!;
         const cb = parseYansanCombo(b)!;
         return (
@@ -1941,7 +2107,7 @@ function findMinimumEffectiveBeat(
           (ca.suitVal || 0) - (cb.suitVal || 0)
         );
       });
-      const best5 = winning5s[0];
+      const best5 = fallback5s[0];
       const bestParsed = parseYansanCombo(best5)!;
       const targTier = target.comboTier || 1;
       // 如果对手只是普通顺子，自己仅剩手牌很多且需要拆大炸弹(四带一/同花顺)才能管时，除非对方牌很少或可绝大，否则忍让

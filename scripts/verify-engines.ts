@@ -19,6 +19,7 @@ import {
   executeMahjongWinSettlement,
   handleMahjongGameMove,
   tickMahjongAutoTurn,
+  tickMahjongClaimWindow,
 } from '../src/server/games/mahjongServerEngine.ts';
 import {
   SSSCard,
@@ -43,6 +44,11 @@ import {
 import {
   sortMahjongHand,
   isYiWuJiuMaTile,
+  calculateMahjongShanten,
+  shouldSmartPengHand,
+  shouldSmartKongHand,
+  findSmartSelfKong,
+  findSmartBestDiscardIdx,
 } from '../src/games/mahjong/aiWinEngine.ts';
 import {
   filterHumanScenePlayers,
@@ -257,7 +263,7 @@ function runYansanTests() {
     'Midgame free lead must shed ordinary 顺子 before 同花顺'
   );
 
-  // 7. Smart AI must block 1-card unknown seat (never feed small single)
+  // 7. Smart AI must block 1-card unknown seat (never feed small single on lead or follow!)
   const handBlockingBaodan = [yCard(4, '♣'), yCard(9, '♠'), yCard(9, '♥'), yCard(11, '♦')];
   const blockUnknown1Card = getYansanSmartAIPlay(handBlockingBaodan, null, {
     seat: 2,
@@ -266,6 +272,35 @@ function runYansanTests() {
   assert(
     blockUnknown1Card.cards && blockUnknown1Card.cards.length === 2 && blockUnknown1Card.cards[0].rank === 9,
     'AI must lead pair/combo rather than feeding a 1-card unknown player'
+  );
+
+  const followBlockHand = [yCard(6, '♣'), yCard(13, '♠'), yCard(15, '♦')];
+  const enemySingle5 = parseYansanCombo([yCard(5, '♠')])!;
+  enemySingle5.seat = 3;
+  const followBlockRes = getYansanSmartAIPlay(followBlockHand, enemySingle5, {
+    seat: 2,
+    handsCount: [8, 1, 3, 8],
+    downstreamSeat: 1,
+    lastTargetSeat: 3,
+  });
+  assert(
+    followBlockRes.cards && followBlockRes.cards.length === 1 && followBlockRes.cards[0].rank === 15,
+    'AI must cover with top single (2♦) rather than feeding 6♣ when downstream non-ally has 1 card'
+  );
+
+  // Even if ally plays a weak 5♠ while downstream enemy has 1 card, AI must block rather than yield!
+  const allyWeak5 = parseYansanCombo([yCard(5, '♠')])!;
+  allyWeak5.seat = 0;
+  const blockOverWeakAllyRes = getYansanSmartAIPlay(followBlockHand, allyWeak5, {
+    seat: 2,
+    handsCount: [8, 1, 3, 8],
+    downstreamSeat: 1,
+    lastTargetSeat: 0,
+    seatPlayedCards: [[yCard(3, '♠')], [], [yCard(14, '♠')], []],
+  });
+  assert(
+    blockOverWeakAllyRes.cards && blockOverWeakAllyRes.cards.length === 1 && blockOverWeakAllyRes.cards[0].rank === 15,
+    'AI must block downstream 1-card enemy with top single even if ally played a weak 5♠'
   );
 
   // 8. Smart AI in 1v3 QiangGong must never block ally when downstream is also ally
@@ -599,6 +634,101 @@ function runMahjongTests() {
   assert.equal(getSceneRequiredCoins('mahjong', 'standard-6'), 100);
   assert.equal(getSceneRequiredCoins('mahjong', 'mahjong-10-20'), 200);
   assert.equal(getSceneRequiredCoins('mahjong', 'mahjong-20-40'), 500);
+
+  // 11. Mahjong Shanten, Smart Peng, Smart Kong, Smart Discard AI checks
+  const tenpaiHand13: MahjongTile[] = [
+    mjTile('wan', 1, 't1'), mjTile('wan', 2, 't2'), mjTile('wan', 3, 't3'),
+    mjTile('tiao', 4, 't4'), mjTile('tiao', 5, 't5'), mjTile('tiao', 6, 't6'),
+    mjTile('tong', 2, 't7'), mjTile('tong', 3, 't8'),
+    mjTile('wan', 7, 't9'), mjTile('wan', 7, 't10'), mjTile('wan', 7, 't11'),
+    mjTile('tong', 9, 't12'), mjTile('tong', 9, 't13'),
+  ];
+  assert.equal(calculateMahjongShanten(tenpaiHand13, false, 0).shanten, 0, 'Tenpai 13-tile hand must have shanten 0');
+
+  // Hand that enters Tenpai (shanten 1 -> 0) by Penging 九筒, even with 1 meld already open
+  const openHand10: MahjongTile[] = [
+    mjTile('wan', 2, 'p1'), mjTile('wan', 3, 'p2'), mjTile('wan', 4, 'p3'),
+    mjTile('tiao', 5, 'p4'), mjTile('tiao', 6, 'p5'),
+    mjTile('tong', 9, 'p6'), mjTile('tong', 9, 'p7'),
+    mjTile('wan', 8, 'p8'), mjTile('wan', 8, 'p9'),
+    mjTile('zi', 1, 'p10'),
+  ];
+  const existingMeld = [mjTile('tiao', 2, 'm1'), mjTile('tiao', 2, 'm2'), mjTile('tiao', 2, 'm3')];
+  assert.equal(
+    shouldSmartPengHand(openHand10, mjTile('tong', 9, 'disc'), true, {
+      hongzhongMode: true,
+      discards: [],
+      meldedTiles: [existingMeld],
+      oppMelds: [[], [], []],
+      wallCount: 40,
+    }),
+    true,
+    'Smart AI must Peng when doing so advances shanten toward Tenpai'
+  );
+
+  // Clean 0-shanten Seven Pairs hand (6 pairs + 1 single, 0 melds): must NOT break 7-pairs by Penging!
+  const sevenPairsTenpai13: MahjongTile[] = [
+    mjTile('wan', 1, 'q1'), mjTile('wan', 1, 'q2'),
+    mjTile('wan', 3, 'q3'), mjTile('wan', 3, 'q4'),
+    mjTile('tiao', 2, 'q5'), mjTile('tiao', 2, 'q6'),
+    mjTile('tiao', 6, 'q7'), mjTile('tiao', 6, 'q8'),
+    mjTile('tong', 4, 'q9'), mjTile('tong', 4, 'q10'),
+    mjTile('tong', 8, 'q11'), mjTile('tong', 8, 'q12'),
+    mjTile('zi', 1, 'q13'),
+  ];
+  assert.equal(
+    shouldSmartPengHand(sevenPairsTenpai13, mjTile('wan', 1, 'disc7p'), false, {
+      hongzhongMode: false,
+      discards: [],
+      meldedTiles: [],
+      oppMelds: [[], [], []],
+      wallCount: 40,
+    }),
+    false,
+    'Smart AI must protect 0-shanten Seven Pairs hand instead of ruining it with Peng'
+  );
+
+  // Best discard must shed isolated East Wind rather than breaking Tenpai or discarding Hongzhong
+  const discardTest14: MahjongTile[] = [
+    ...tenpaiHand13,
+    mjTile('zi', 1, 'isolated-east'),
+  ];
+  const bestIdx = findSmartBestDiscardIdx(discardTest14, {
+    hongzhongMode: true,
+    discards: [],
+    meldedTiles: [],
+    oppMelds: [[], [], []],
+    wallCount: 40,
+  });
+  assert.equal(discardTest14[bestIdx].id, 'zi-1-isolated-east', 'Smart discard must shed isolated East Wind to lock Tenpai');
+
+  // Self-Kong detection (An-Gang & Bu-Gang)
+  const anGangHand14: MahjongTile[] = [
+    mjTile('wan', 4, 'ag1'), mjTile('wan', 4, 'ag2'), mjTile('wan', 4, 'ag3'), mjTile('wan', 4, 'ag4'),
+    ...tenpaiHand13.slice(0, 10),
+  ];
+  const foundAnGang = findSmartSelfKong(anGangHand14, [], true, {
+    hongzhongMode: true,
+    discards: [],
+    meldedTiles: [],
+    oppMelds: [[], [], []],
+    wallCount: 30,
+  });
+  assert(foundAnGang && foundAnGang.gangType === 'an' && foundAnGang.tile.value === 4, 'Smart AI must detect valid An-Gang');
+
+  const buGangHand11: MahjongTile[] = [
+    mjTile('tiao', 2, 'bg1'),
+    ...openHand10,
+  ];
+  const foundBuGang = findSmartSelfKong(buGangHand11, [existingMeld], true, {
+    hongzhongMode: true,
+    discards: [],
+    meldedTiles: [existingMeld],
+    oppMelds: [[], [], []],
+    wallCount: 30,
+  });
+  assert(foundBuGang && foundBuGang.gangType === 'bu' && foundBuGang.tile.value === 2, 'Smart AI must detect valid Bu-Gang');
+  assert.equal(shouldSmartKongHand(anGangHand14, mjTile('wan', 4, 'ag1'), 'an', true, { wallCount: 30 }), true);
 }
 
 function runSanitizerTests() {
@@ -1147,6 +1277,83 @@ function runServerEngineRegressionTests() {
   );
   assert.equal(mjClaimRoom.boardState.extraState.pendingPengSeat, null);
   assert.equal(mjClaimRoom.boardState.turnSeat, 3);
+
+  // 9. Mahjong Server Engine: auto-hosted / bot seat MUST claim Peng automatically during tickMahjongClaimWindow
+  const botPengTarget = mjTile('wan', 6, 'bot-d1');
+  const botHand13 = [
+    mjTile('wan', 6, 'b1'), mjTile('wan', 6, 'b2'),
+    mjTile('wan', 1, 'b3'), mjTile('wan', 2, 'b4'), mjTile('wan', 3, 'b5'),
+    mjTile('tiao', 4, 'b6'), mjTile('tiao', 5, 'b7'), mjTile('tiao', 6, 'b8'),
+    mjTile('tong', 2, 'b9'), mjTile('tong', 3, 'b10'),
+    mjTile('tong', 8, 'b11'), mjTile('tong', 8, 'b12'),
+    mjTile('zi', 1, 'b13'),
+  ];
+  const mjBotClaimRoom: any = {
+    id: 'test-mj-bot-auto-peng',
+    gameType: 'mahjong',
+    sceneMode: 'hongzhong-6',
+    status: 'playing',
+    moveCount: 0,
+    turnSeat: 0,
+    players: [
+      { id: 'h0', seat: 0 },
+      { id: 'sim-1', seat: 1, isSimulated: true },
+      { id: 'sim-2', seat: 2, isSimulated: true }, // Bot seat 2
+      { id: 'sim-3', seat: 3, isSimulated: true },
+    ],
+    deal: {
+      seatCards: {
+        0: [botPengTarget, ...fillerHand13('bs0')],
+        1: fillerHand13('bs1'),
+        2: botHand13,
+        3: fillerHand13('bs3'),
+      },
+      remainingWall: Array.from({ length: 24 }, (_, i) => mjTile('tiao', 9, `bw-${i}`)),
+    },
+    boardState: {
+      phase: 'playing',
+      turnSeat: 0,
+      handsCount: [14, 13, 13, 13],
+      seatKongScores: [0, 0, 0, 0],
+      extraState: {
+        wallRemaining: 24,
+        mahjongDiscards: [],
+        mahjongMelds: [[], [], [], []],
+        pendingPengSeat: null,
+        claimWindow: null,
+        lastDiscarded: null,
+      },
+    },
+  };
+
+  handleMahjongGameMove(
+    mockCtx,
+    mockWs,
+    mjBotClaimRoom,
+    0,
+    'discard',
+    null,
+    { tile: botPengTarget, absSeat: 0 },
+    { action: 'discard', tile: botPengTarget }
+  );
+  const botClaimWin = mjBotClaimRoom.boardState.extraState.claimWindow;
+  assert(botClaimWin && botClaimWin.pendingSeats.includes(2), 'Bot seat 2 must be included in claimWindow.pendingSeats');
+  assert.equal(botClaimWin.autoClaims?.[2]?.action, 'peng', 'Bot seat 2 must plan Peng on advancing discard');
+
+  // Tick claim window past planned executeAt -> bot auto-Peng executes cleanly
+  const execTime = botClaimWin.autoClaims[2].executeAt + 50;
+  const handledClaim = tickMahjongClaimWindow(mockCtx, mjBotClaimRoom, execTime);
+  assert.equal(handledClaim, true);
+  assert.equal(mjBotClaimRoom.boardState.extraState.claimWindow, null, 'claimWindow must close after bot Peng');
+  assert.equal(mjBotClaimRoom.boardState.extraState.pendingPengSeat, 2, 'pendingPengSeat must lock to bot seat 2');
+  assert.equal(mjBotClaimRoom.boardState.turnSeat, 2, 'turnSeat must jump to bot seat 2 after Peng');
+  assert.equal(mjBotClaimRoom.boardState.extraState.mahjongMelds[2].length, 1);
+
+  // Bot auto-turn immediately discards smartly (isolated zi-1) and advances turn to seat 3
+  tickMahjongAutoTurn(mockCtx, mjBotClaimRoom, 2, execTime + 1500);
+  assert.equal(mjBotClaimRoom.boardState.extraState.pendingPengSeat, null, 'Bot post-Peng discard must clear pendingPengSeat');
+  assert.equal(mjBotClaimRoom.boardState.turnSeat, 3, 'Turn must advance to seat 3 after bot post-Peng discard');
+  assert.equal(mjBotClaimRoom.deal.seatCards[2].length, 10, 'Bot seat 2 must have 10 tiles remaining after Peng + discard');
 }
 
 runYansanTests();

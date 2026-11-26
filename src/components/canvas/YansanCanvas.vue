@@ -1348,10 +1348,9 @@ function checkAutoHostTurn() {
   seatStatus[mySeat.value] = '⚡ 托管思考出牌中...';
   drawTable();
 
-  // 1. 强攻判断：同时持黑桃3和黑桃A(双煞)，13张手牌均未动，且本局未曾点击过牌
+  // 1. 强攻判断：同时持黑桃3和黑桃A(双煞)，13张手牌均未动，且本局未曾点击过牌，结合最优拆牌实力评估
   if (!isQiangGongActive.value && !hasPassedSeats[mySeat.value] && hands[mySeat.value].length === 13 && hasSpade3AndA(mySeat.value)) {
-    const highCards = hands[mySeat.value].filter((c) => getRankWeight(c.rank) >= 10);
-    if (highCards.length >= 4) {
+    if (shouldYansanAIQiangGong(hands[mySeat.value] as any)) {
       handleQiangGong(mySeat.value);
       return;
     }
@@ -4046,12 +4045,27 @@ function getEnhancedAIPlay(seat: number): Card[] | null {
 
   // 5. 备选方案：若规则引擎决策未完全匹配，使用规则推理严谨决策
   if (targetCombo) {
-    // 关键强化：若目标为推断出的盟友所出，绝不击打盟友牌，战术让行！
+    // 关键强化：若目标为推断出的盟友所出，绝不击打盟友牌（除非下家非盟友已报单），战术让行！
     const targetSeat = targetCombo.seat;
     const isTargetAlly = smartResult.deducedAlliances && smartResult.deducedAlliances[targetSeat] && smartResult.deducedAlliances[targetSeat].score >= 0.35;
-    if (isTargetAlly) {
+    const downstreamSeat = getNextActiveSeat(seat);
+    const downstreamIsDanger =
+      downstreamSeat !== seat &&
+      handsCount[downstreamSeat] === 1 &&
+      (smartResult.deducedAlliances?.[downstreamSeat]?.score ?? 0) < 0.35;
+    if (isTargetAlly && !downstreamIsDanger) {
       aiThoughts[seat] = `【盟友让行】桌面由盟友掌控，不打盟友牌，战术过牌`;
       return null;
+    }
+    if (downstreamIsDanger && targetCombo.type === 'single') {
+      const sortedDesc = [...currentHand].sort((a, b) => getCardPower(b) - getCardPower(a));
+      for (const c of sortedDesc) {
+        const ev = evaluateCombo([c], seat);
+        if (ev && canBeat(ev, targetCombo)) {
+          aiThoughts[seat] = '【下家报单顶大】防走强力封堵单张';
+          return [c];
+        }
+      }
     }
     return findWinningCombo(currentHand, targetCombo, seat);
   } else {

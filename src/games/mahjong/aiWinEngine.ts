@@ -340,30 +340,335 @@ export function checkHongzhongWinLocal(hand: Pick<MahjongTile, 'type' | 'value' 
   return false;
 }
 
-export function shouldSmartPengHand(hand: MahjongTile[], tile: MahjongTile, hongzhongMode: boolean): boolean {
+export interface MahjongAiContext {
+  hongzhongMode: boolean;
+  discards: MahjongTile[];
+  meldedTiles: MahjongTile[][];
+  oppMelds: MahjongTile[][][];
+  wallCount: number;
+}
+
+const suitShapeCache = new Map<string, Array<[number, number]>>();
+
+function addParetoState(states: Array<[number, number]>, m: number, t: number) {
+  for (let i = 0; i < states.length; i++) {
+    const [em, et] = states[i];
+    if (em >= m && em + et >= m + t) return;
+  }
+  for (let i = states.length - 1; i >= 0; i--) {
+    const [em, et] = states[i];
+    if (m >= em && m + t >= em + et) {
+      states.splice(i, 1);
+    }
+  }
+  states.push([m, t]);
+}
+
+function evalSuitMeldTaatsu(counts: number[]): Array<[number, number]> {
+  const key = counts.slice(1, 10).join('');
+  const cached = suitShapeCache.get(key);
+  if (cached) return cached;
+  if (suitShapeCache.size > 6000) suitShapeCache.clear();
+
+  const states: Array<[number, number]> = [[0, 0]];
+  const dfs = (pos: number, m: number, t: number) => {
+    while (pos <= 9 && counts[pos] === 0) pos++;
+    if (pos > 9) {
+      addParetoState(states, m, t);
+      return;
+    }
+
+    // 1. Triplet (刻子)
+    if (counts[pos] >= 3) {
+      counts[pos] -= 3;
+      dfs(pos, m + 1, t);
+      counts[pos] += 3;
+    }
+
+    // 2. Sequence (顺子)
+    if (pos <= 7 && counts[pos + 1] > 0 && counts[pos + 2] > 0) {
+      counts[pos]--;
+      counts[pos + 1]--;
+      counts[pos + 2]--;
+      dfs(pos, m + 1, t);
+      counts[pos]++;
+      counts[pos + 1]++;
+      counts[pos + 2]++;
+    }
+
+    // 3. Pair as taatsu (对子搭子)
+    if (counts[pos] >= 2) {
+      counts[pos] -= 2;
+      dfs(pos, m, t + 1);
+      counts[pos] += 2;
+    }
+
+    // 4. Two-sided / edge taatsu (两面/边张搭子)
+    if (pos <= 8 && counts[pos + 1] > 0) {
+      counts[pos]--;
+      counts[pos + 1]--;
+      dfs(pos, m, t + 1);
+      counts[pos]++;
+      counts[pos + 1]++;
+    }
+
+    // 5. Gap taatsu (嵌张搭子)
+    if (pos <= 7 && counts[pos + 2] > 0) {
+      counts[pos]--;
+      counts[pos + 2]--;
+      dfs(pos, m, t + 1);
+      counts[pos]++;
+      counts[pos + 2]++;
+    }
+
+    // 6. Skip 1 isolated tile
+    const prev = counts[pos];
+    counts[pos] = prev - 1;
+    dfs(pos, m, t);
+    counts[pos] = prev;
+  };
+
+  dfs(1, 0, 0);
+  suitShapeCache.set(key, states);
+  return states;
+}
+
+function evalZiMeldTaatsu(counts: number[]): [number, number] {
+  let m = 0;
+  let t = 0;
+  for (let v = 1; v <= 7; v++) {
+    const c = counts[v];
+    if (c >= 3) {
+      m++;
+      if (c >= 5) t++;
+    } else if (c === 2) {
+      t++;
+    }
+  }
+  return [m, t];
+}
+
+function computeRegularShantenRaw(
+  suitCounts: [number[], number[], number[], number[]],
+  targetMelds: number
+): number {
+  const evalWithoutPair = (): number => {
+    const s0 = evalSuitMeldTaatsu(suitCounts[0]);
+    const s1 = evalSuitMeldTaatsu(suitCounts[1]);
+    const s2 = evalSuitMeldTaatsu(suitCounts[2]);
+    const [zm, zt] = evalZiMeldTaatsu(suitCounts[3]);
+
+    let best = targetMelds * 2;
+    for (const [m0, t0] of s0) {
+      for (const [m1, t1] of s1) {
+        for (const [m2, t2] of s2) {
+          const totalM = Math.min(targetMelds, m0 + m1 + m2 + zm);
+          const totalT = Math.min(targetMelds - totalM, t0 + t1 + t2 + zt);
+          const s = targetMelds * 2 - totalM * 2 - totalT;
+          if (s < best) best = s;
+        }
+      }
+    }
+    return best;
+  };
+
+  let bestShanten = evalWithoutPair();
+
+  // Try selecting each existing pair as the eye (雀头)
+  for (let typeIdx = 0; typeIdx < 4; typeIdx++) {
+    const maxVal = typeIdx === 3 ? 7 : 9;
+    for (let v = 1; v <= maxVal; v++) {
+      if (suitCounts[typeIdx][v] >= 2) {
+        suitCounts[typeIdx][v] -= 2;
+        const s0 = evalSuitMeldTaatsu(suitCounts[0]);
+        const s1 = evalSuitMeldTaatsu(suitCounts[1]);
+        const s2 = evalSuitMeldTaatsu(suitCounts[2]);
+        const [zm, zt] = evalZiMeldTaatsu(suitCounts[3]);
+
+        for (const [m0, t0] of s0) {
+          for (const [m1, t1] of s1) {
+            for (const [m2, t2] of s2) {
+              const totalM = Math.min(targetMelds, m0 + m1 + m2 + zm);
+              const totalT = Math.min(targetMelds - totalM, t0 + t1 + t2 + zt);
+              const s = targetMelds * 2 - totalM * 2 - totalT - 1;
+              if (s < bestShanten) bestShanten = s;
+            }
+          }
+        }
+        suitCounts[typeIdx][v] += 2;
+      }
+    }
+  }
+
+  return bestShanten;
+}
+
+export function calculateMahjongShanten(
+  hand: Pick<MahjongTile, 'type' | 'value' | 'text'>[],
+  hongzhongMode: boolean,
+  meldsCountOverride?: number
+): { shanten: number; stdShanten: number; sevenPairsShanten: number } {
+  const meldsCount =
+    meldsCountOverride !== undefined ? meldsCountOverride : Math.max(0, 4 - Math.floor(hand.length / 3));
+  const targetMelds = Math.max(0, 4 - meldsCount);
+
+  if (hand.length % 3 === 2) {
+    const isWin = hongzhongMode ? checkHongzhongWinLocal(hand) : checkMahjongWinLocal(hand);
+    if (isWin) {
+      return { shanten: -1, stdShanten: -1, sevenPairsShanten: -1 };
+    }
+  }
+
+  const hzCount = hongzhongMode ? hand.filter((t) => (t.type === 'zi' && t.value === 5) || t.text === '红中').length : 0;
+  if (hongzhongMode && hzCount >= 4) {
+    return { shanten: -1, stdShanten: -1, sevenPairsShanten: -1 };
+  }
+
+  const suitCounts: [number[], number[], number[], number[]] = [
+    new Array(10).fill(0),
+    new Array(10).fill(0),
+    new Array(10).fill(0),
+    new Array(8).fill(0),
+  ];
+
+  let nonHzPairsForSeven = 0;
+  const nonHzKindMap = new Map<string, number>();
+
+  for (const t of hand) {
+    if (hongzhongMode && ((t.type === 'zi' && t.value === 5) || t.text === '红中')) continue;
+    if (t.type === 'wan') suitCounts[0][t.value]++;
+    else if (t.type === 'tiao') suitCounts[1][t.value]++;
+    else if (t.type === 'tong') suitCounts[2][t.value]++;
+    else if (t.type === 'zi' && t.value >= 1 && t.value <= 7) suitCounts[3][t.value]++;
+
+    const k = `${t.type}-${t.value}`;
+    nonHzKindMap.set(k, (nonHzKindMap.get(k) || 0) + 1);
+  }
+
+  for (const cnt of nonHzKindMap.values()) {
+    nonHzPairsForSeven += Math.floor(cnt / 2);
+  }
+
+  const rawStd = computeRegularShantenRaw(suitCounts, targetMelds);
+  const minPossibleForSize = hand.length % 3 === 2 ? 0 : 0;
+  const stdShanten = Math.max(minPossibleForSize, rawStd - hzCount);
+
+  let sevenPairsShanten = 99;
+  if (meldsCount === 0 && hand.length >= 13) {
+    sevenPairsShanten = Math.max(0, 6 - nonHzPairsForSeven - hzCount);
+  }
+
+  return {
+    shanten: Math.min(stdShanten, sevenPairsShanten),
+    stdShanten,
+    sevenPairsShanten,
+  };
+}
+
+function buildVisibleCountsMap(ctx: Partial<MahjongAiContext>): Record<string, number> {
+  const visibleCounts: Record<string, number> = {};
+  (ctx.discards || []).forEach((t) => {
+    const key = `${t.type}-${t.value}`;
+    visibleCounts[key] = (visibleCounts[key] || 0) + 1;
+  });
+  (ctx.meldedTiles || []).forEach((meld) => {
+    meld.forEach((t) => {
+      const key = `${t.type}-${t.value}`;
+      visibleCounts[key] = (visibleCounts[key] || 0) + 1;
+    });
+  });
+  (ctx.oppMelds || []).forEach((playerMelds) => {
+    playerMelds.forEach((meld) => {
+      meld.forEach((t) => {
+        const key = `${t.type}-${t.value}`;
+        visibleCounts[key] = (visibleCounts[key] || 0) + 1;
+      });
+    });
+  });
+  return visibleCounts;
+}
+
+function evaluateHandUkeire(
+  hand3k1: MahjongTile[],
+  hongzhongMode: boolean,
+  visibleCounts: Record<string, number>,
+  meldsCount: number
+): { shanten: number; ukeire: number; tingDoors: number; tingTiles: number; advancingDoors: number } {
+  const { shanten } = calculateMahjongShanten(hand3k1, hongzhongMode, meldsCount);
+  let ukeire = 0;
+  let tingDoors = 0;
+  let tingTiles = 0;
+  let advancingDoors = 0;
+
+  const inHandCounts: Record<string, number> = {};
+  for (const t of hand3k1) {
+    const k = `${t.type}-${t.value}`;
+    inHandCounts[k] = (inHandCounts[k] || 0) + 1;
+  }
+
+  for (const kind of ALL_TILE_KINDS) {
+    const key = `${kind.type}-${kind.value}`;
+    const used = (visibleCounts[key] || 0) + (inHandCounts[key] || 0);
+    const availableInWall = Math.max(0, 4 - used);
+    if (availableInWall === 0) continue;
+
+    if (shanten === 0) {
+      const test14 = [...hand3k1, { id: 'test-u', type: kind.type, value: kind.value, text: kind.text, color: '' }];
+      const canWin = hongzhongMode ? checkHongzhongWinLocal(test14) : checkMahjongWinLocal(test14);
+      if (canWin) {
+        tingDoors++;
+        tingTiles += availableInWall;
+        ukeire += availableInWall;
+      }
+    } else {
+      // Quick relevance filter when no Hongzhong and shanten > 0 (unless pursuing 7-pairs)
+      const isHzKind = hongzhongMode && kind.type === 'zi' && kind.value === 5;
+      const hasConnection =
+        isHzKind ||
+        (inHandCounts[key] || 0) > 0 ||
+        (kind.type !== 'zi' &&
+          ((inHandCounts[`${kind.type}-${kind.value - 1}`] || 0) > 0 ||
+            (inHandCounts[`${kind.type}-${kind.value + 1}`] || 0) > 0 ||
+            (inHandCounts[`${kind.type}-${kind.value - 2}`] || 0) > 0 ||
+            (inHandCounts[`${kind.type}-${kind.value + 2}`] || 0) > 0));
+      if (!hasConnection) continue;
+
+      const test14 = [...hand3k1, { id: 'test-u', type: kind.type, value: kind.value, text: kind.text, color: '' }];
+      const nextRes = calculateMahjongShanten(test14, hongzhongMode, meldsCount);
+      if (nextRes.shanten < shanten) {
+        advancingDoors++;
+        ukeire += availableInWall;
+      }
+    }
+  }
+
+  return { shanten, ukeire, tingDoors, tingTiles, advancingDoors };
+}
+
+export function shouldSmartPengHand(
+  hand: MahjongTile[],
+  tile: MahjongTile,
+  hongzhongMode: boolean,
+  ctx?: Partial<MahjongAiContext>
+): boolean {
   if (!tile) return false;
   if (hongzhongMode && isHongzhong(tile)) return false;
 
   const matches = hand.filter((c) => c.type === tile.type && c.value === tile.value);
   if (matches.length < 2) return false;
 
-  const counts = new Map<string, number>();
-  hand.forEach((c) => {
-    if (hongzhongMode && isHongzhong(c)) return;
-    counts.set(`${c.type}-${c.value}`, (counts.get(`${c.type}-${c.value}`) || 0) + 1);
-  });
-  let pairCount = 0;
-  for (const cnt of counts.values()) {
-    if (cnt >= 2) pairCount++;
-  }
-  if (pairCount >= 4) {
-    return false;
-  }
+  const meldsCount =
+    ctx?.meldedTiles !== undefined ? ctx.meldedTiles.length : Math.max(0, 4 - Math.floor(hand.length / 3));
+  const visibleCounts = ctx ? buildVisibleCountsMap(ctx) : {};
 
-  if (tile.type === 'zi') {
-    return true;
-  }
+  // Evaluate hand BEFORE Peng
+  const beforeInfo = evaluateHandUkeire(hand, hongzhongMode, visibleCounts, meldsCount);
+  const beforeShantenInfo = calculateMahjongShanten(hand, hongzhongMode, meldsCount);
 
+  // Only preserve 7-pairs if NO melds yet and already 1-shanten or Tenpai for 7-pairs
+  const pursuingSevenPairs = meldsCount === 0 && beforeShantenInfo.sevenPairsShanten <= 1;
+
+  // Simulate Peng: remove 2 copies and test every post-Peng discard
   const remainingHand = [...hand];
   let removed = 0;
   for (let i = remainingHand.length - 1; i >= 0 && removed < 2; i--) {
@@ -372,42 +677,190 @@ export function shouldSmartPengHand(hand: MahjongTile[], tile: MahjongTile, hong
       removed++;
     }
   }
+  if (remainingHand.length === 0) return false;
 
-  const suitTiles = hand.filter((c) => c.type === tile.type).map((c) => c.value);
-  const v = tile.value;
-  const isEmbeddedInSequence =
-    (suitTiles.includes(v - 1) && suitTiles.includes(v + 1)) ||
-    (suitTiles.includes(v - 2) && suitTiles.includes(v - 1)) ||
-    (suitTiles.includes(v + 1) && suitTiles.includes(v + 2));
+  // Add the Peng tile to visible counts accurately for post-Peng ukeire calculation
+  const postVisible = { ...visibleCounts };
+  const tileKey = `${tile.type}-${tile.value}`;
+  postVisible[tileKey] = Math.min(4, (postVisible[tileKey] || 0) + 3);
 
-  let canTingAfterPeng = false;
+  let bestAfterShanten = 99;
+  let bestAfterUkeire = -1;
+  const seenDiscardKinds = new Set<string>();
+
   for (let i = 0; i < remainingHand.length; i++) {
-    const test13 = remainingHand.filter((_, idx) => idx !== i);
-    for (const kind of ALL_TILE_KINDS) {
-      const test14 = [...test13, { id: 'test-ting', type: kind.type, value: kind.value, text: kind.text }];
-      if (hongzhongMode ? checkHongzhongWinLocal(test14) : checkMahjongWinLocal(test14)) {
-        canTingAfterPeng = true;
-        break;
-      }
+    const cand = remainingHand[i];
+    if (hongzhongMode && isHongzhong(cand)) continue;
+    const ck = `${cand.type}-${cand.value}`;
+    if (seenDiscardKinds.has(ck)) continue;
+    seenDiscardKinds.add(ck);
+
+    const nextHand = remainingHand.filter((_, idx) => idx !== i);
+    const afterInfo = evaluateHandUkeire(nextHand, hongzhongMode, postVisible, meldsCount + 1);
+    if (
+      afterInfo.shanten < bestAfterShanten ||
+      (afterInfo.shanten === bestAfterShanten && afterInfo.ukeire > bestAfterUkeire)
+    ) {
+      bestAfterShanten = afterInfo.shanten;
+      bestAfterUkeire = afterInfo.ukeire;
     }
-    if (canTingAfterPeng) break;
   }
 
-  if (canTingAfterPeng) return true;
-
-  if (isEmbeddedInSequence && matches.length === 2) {
+  // If 7-pairs is closer or equal to post-Peng Tenpai/1-shanten and we are 0-shanten 7-pairs, keep 7-pairs!
+  if (pursuingSevenPairs && beforeShantenInfo.sevenPairsShanten <= bestAfterShanten && bestAfterShanten > 0) {
     return false;
   }
 
-  return true;
+  // 1. Enters Tenpai (听牌)!
+  if (bestAfterShanten === 0) {
+    if (beforeInfo.shanten > 0) return bestAfterUkeire > 0 || bestAfterShanten < beforeInfo.shanten;
+    // Already Tenpai: Peng only if it increases remaining winning tiles
+    return bestAfterUkeire > beforeInfo.ukeire;
+  }
+
+  // 2. Strictly reduces Shanten (向听数前进)!
+  if (bestAfterShanten < beforeInfo.shanten) {
+    // If jumping from 7-pairs 1-shanten with > 5 live waits vs weak 1-shanten after peng
+    if (pursuingSevenPairs && beforeShantenInfo.sevenPairsShanten === 1 && bestAfterUkeire < 4) {
+      return false;
+    }
+    return true;
+  }
+
+  // 3. Same Shanten: evaluate strategic speed value
+  if (bestAfterShanten === beforeInfo.shanten) {
+    // Wind / Dragon triplets cannot be formed as sequences — always lock them in when shanten doesn't worsen
+    if (tile.type === 'zi') {
+      return true;
+    }
+    // If already open hand (1+ melds), prioritize speed unless it severely cripples waits
+    if (meldsCount >= 1 && bestAfterUkeire >= Math.max(2, Math.floor(beforeInfo.ukeire * 0.65))) {
+      return true;
+    }
+    // Terminal pairs (1/9) or pure duplicate triplet lock-ins
+    if ((tile.value === 1 || tile.value === 9) && bestAfterUkeire >= Math.max(2, Math.floor(beforeInfo.ukeire * 0.75))) {
+      return true;
+    }
+    // Strict ukeire gain
+    if (bestAfterUkeire > beforeInfo.ukeire) {
+      return true;
+    }
+    // Mid-game 1-shanten/2-shanten acceleration when tile isn't deeply embedded in two sequences
+    if (bestAfterShanten <= 2 && bestAfterUkeire >= beforeInfo.ukeire - 2) {
+      const suitVals = hand.filter((c) => c.type === tile.type).map((c) => c.value);
+      const v = tile.value;
+      const isDoubleConnected =
+        (suitVals.includes(v - 1) && suitVals.includes(v + 1)) ||
+        (suitVals.includes(v - 2) && suitVals.includes(v - 1) && suitVals.includes(v + 1));
+      if (!isDoubleConnected) return true;
+    }
+  }
+
+  return false;
 }
 
-export interface MahjongAiContext {
-  hongzhongMode: boolean;
-  discards: MahjongTile[];
-  meldedTiles: MahjongTile[][];
-  oppMelds: MahjongTile[][][];
-  wallCount: number;
+export function shouldSmartKongHand(
+  hand: MahjongTile[],
+  tile: MahjongTile,
+  gangType: 'ming' | 'an' | 'bu',
+  hongzhongMode: boolean,
+  ctx?: Partial<MahjongAiContext>
+): boolean {
+  if (!tile) return false;
+  if (hongzhongMode && isHongzhong(tile)) return false;
+  if (ctx?.wallCount !== undefined && ctx.wallCount <= 0) return false;
+
+  const meldsCount =
+    ctx?.meldedTiles !== undefined ? ctx.meldedTiles.length : Math.max(0, 4 - Math.floor(hand.length / 3));
+
+  if (gangType === 'ming') {
+    const matches = hand.filter((c) => c.type === tile.type && c.value === tile.value);
+    if (matches.length < 3 || hand.length % 3 !== 1) return false;
+    const before = calculateMahjongShanten(hand, hongzhongMode, meldsCount);
+    const rem = [...hand];
+    let removed = 0;
+    for (let i = rem.length - 1; i >= 0 && removed < 3; i--) {
+      if (rem[i].type === tile.type && rem[i].value === tile.value) {
+        rem.splice(i, 1);
+        removed++;
+      }
+    }
+    const after = calculateMahjongShanten(rem, hongzhongMode, meldsCount + 1);
+    // Do not break a clean 0-shanten multi-wait hand if Kong drops it to 2+ shanten
+    if (before.shanten === 0 && after.shanten >= 2) return false;
+    return true;
+  }
+
+  if (gangType === 'an') {
+    const matches = hand.filter((c) => c.type === tile.type && c.value === tile.value);
+    if (matches.length < 4 || hand.length % 3 !== 2) return false;
+    // Compute best shanten before An-Gang (across discards)
+    let bestBefore = 99;
+    for (let i = 0; i < hand.length; i++) {
+      const sub = hand.filter((_, idx) => idx !== i);
+      const res = calculateMahjongShanten(sub, hongzhongMode, meldsCount);
+      if (res.shanten < bestBefore) bestBefore = res.shanten;
+    }
+    const rem = hand.filter((c) => !(c.type === tile.type && c.value === tile.value));
+    const after = calculateMahjongShanten(rem, hongzhongMode, meldsCount + 1);
+    if (bestBefore === 0 && after.shanten >= 2) return false;
+    return true;
+  }
+
+  // Bu-Gang (补杠): almost always +30 points + free supplemental draw
+  if (gangType === 'bu') {
+    const idx = hand.findIndex((c) => c.type === tile.type && c.value === tile.value);
+    if (idx < 0 || hand.length % 3 !== 2) return false;
+    let bestBefore = 99;
+    for (let i = 0; i < hand.length; i++) {
+      const sub = hand.filter((_, j) => j !== i);
+      const res = calculateMahjongShanten(sub, hongzhongMode, meldsCount);
+      if (res.shanten < bestBefore) bestBefore = res.shanten;
+    }
+    const rem = hand.filter((_, j) => j !== idx);
+    const after = calculateMahjongShanten(rem, hongzhongMode, meldsCount);
+    if (bestBefore === 0 && after.shanten >= 2) return false;
+    return true;
+  }
+
+  return false;
+}
+
+export function findSmartSelfKong(
+  hand: MahjongTile[],
+  melds: MahjongTile[][],
+  hongzhongMode: boolean,
+  ctx?: Partial<MahjongAiContext>
+): { gangType: 'an' | 'bu'; tile: MahjongTile } | null {
+  if (hand.length % 3 !== 2) return null;
+  if (ctx?.wallCount !== undefined && ctx.wallCount <= 0) return null;
+
+  // 1. Check An-Gang candidates
+  const counts = new Map<string, MahjongTile[]>();
+  for (const c of hand) {
+    if (hongzhongMode && isHongzhong(c)) continue;
+    const k = `${c.type}-${c.value}`;
+    if (!counts.has(k)) counts.set(k, []);
+    counts.get(k)!.push(c);
+  }
+  for (const tiles of counts.values()) {
+    if (tiles.length === 4 && shouldSmartKongHand(hand, tiles[0], 'an', hongzhongMode, ctx)) {
+      return { gangType: 'an', tile: tiles[0] };
+    }
+  }
+
+  // 2. Check Bu-Gang candidates
+  const normalizedMelds = normalizeServerMelds(melds as any[]);
+  for (const meld of normalizedMelds) {
+    if (meld.length === 3 && meld[0] && meld[0].type === meld[1]?.type && meld[0].value === meld[1]?.value) {
+      const match = hand.find((c) => c.type === meld[0].type && c.value === meld[0].value);
+      if (match && shouldSmartKongHand(hand, match, 'bu', hongzhongMode, ctx)) {
+        return { gangType: 'bu', tile: match };
+      }
+    }
+  }
+
+  return null;
 }
 
 export function scoreMahjongHand(
@@ -420,14 +873,16 @@ export function scoreMahjongHand(
   const isWin = ctx.hongzhongMode ? checkHongzhongWinLocal(tiles) : checkMahjongWinLocal(tiles);
   if (isWin) return 100000;
 
+  const meldsCount = ctx.meldedTiles?.length ?? Math.max(0, 4 - Math.floor(tiles.length / 3));
+  const shantenInfo = calculateMahjongShanten(tiles, ctx.hongzhongMode, meldsCount);
+  let totalScore = (8 - shantenInfo.shanten) * 6000;
+
   const groups: Record<string, number[]> = { wan: [], tiao: [], tong: [], zi: [] };
   tiles.forEach((t) => groups[t.type].push(t.value));
 
-  let totalScore = 0;
-
   if (ctx.hongzhongMode) {
     const hzCount = tiles.filter(isHongzhong).length;
-    totalScore += hzCount * 2500;
+    totalScore += hzCount * 2200;
   }
 
   for (const type in groups) {
@@ -444,14 +899,14 @@ export function scoreMahjongHand(
         const c = counts[v];
         if (ctx.hongzhongMode && v === 5) continue;
         if (c >= 3) totalScore += 600;
-        else if (c === 2) totalScore += 250;
-        else if (c === 1) totalScore -= 300;
+        else if (c === 2) totalScore += 260;
+        else if (c === 1) totalScore -= 280;
       }
     } else {
       const cMap = [...counts];
       for (let v = 1; v <= 9; v++) {
         if (cMap[v] >= 3) {
-          totalScore += 700;
+          totalScore += 680;
           cMap[v] -= 3;
         }
       }
@@ -465,20 +920,22 @@ export function scoreMahjongHand(
       }
       for (let v = 1; v <= 9; v++) {
         if (cMap[v] >= 2) {
-          totalScore += 300;
+          totalScore += 280;
           cMap[v] -= 2;
         }
       }
       for (let v = 1; v <= 8; v++) {
         if (cMap[v] > 0 && cMap[v + 1] > 0) {
-          totalScore += 220;
+          // Two-sided ryanmen (23..78) is strictly better than edge 12/89
+          const isEdge = v === 1 || v === 8;
+          totalScore += isEdge ? 140 : 250;
           cMap[v]--;
           cMap[v + 1]--;
         }
       }
       for (let v = 1; v <= 7; v++) {
         if (cMap[v] > 0 && cMap[v + 2] > 0) {
-          totalScore += 140;
+          totalScore += 150;
           cMap[v]--;
           cMap[v + 2]--;
         }
@@ -486,32 +943,20 @@ export function scoreMahjongHand(
       for (let v = 1; v <= 9; v++) {
         if (cMap[v] > 0) {
           if (v === 1 || v === 9) totalScore -= 180;
-          else totalScore -= 80;
+          else if (v === 2 || v === 8) totalScore -= 90;
+          else totalScore -= 40;
         }
       }
     }
   }
 
   if (evaluateTing) {
-    let tingKindsCount = 0;
-    let totalTingTilesAvailable = 0;
-
-    for (const kind of ALL_TILE_KINDS) {
-      const test14 = [...tiles, { id: 'test-ting', type: kind.type, value: kind.value, text: kind.text }];
-      const canWin = ctx.hongzhongMode ? checkHongzhongWinLocal(test14) : checkMahjongWinLocal(test14);
-      if (canWin) {
-        tingKindsCount++;
-        const kindKey = `${kind.type}-${kind.value}`;
-        const used =
-          ctx.discards.filter((d) => `${d.type}-${d.value}` === kindKey).length +
-          ctx.meldedTiles.flatMap((m) => m).filter((t) => `${t.type}-${t.value}` === kindKey).length +
-          tiles.filter((t) => `${t.type}-${t.value}` === kindKey).length;
-        totalTingTilesAvailable += Math.max(0, 4 - used);
-      }
-    }
-
-    if (tingKindsCount > 0) {
-      totalScore += 20000 + tingKindsCount * 1500 + totalTingTilesAvailable * 200;
+    const vis = buildVisibleCountsMap(ctx);
+    const uRes = evaluateHandUkeire(tiles, ctx.hongzhongMode, vis, meldsCount);
+    if (uRes.tingDoors > 0) {
+      totalScore += 20000 + uRes.tingDoors * 1500 + uRes.tingTiles * 300;
+    } else {
+      totalScore += uRes.ukeire * 180;
     }
   }
 
@@ -538,132 +983,72 @@ export function findSmartBestDiscardIdx(hand: MahjongTile[], ctx: MahjongAiConte
   }
   const evalIndices = uniqueCandidateIndices.length > 0 ? uniqueCandidateIndices : candidateIndices;
 
+  const visibleCounts = buildVisibleCountsMap(ctx);
+  const meldsCount = ctx.meldedTiles?.length ?? Math.max(0, 4 - Math.floor(hand.length / 3));
+  const oppMaxMelds = Math.max(0, ...(ctx.oppMelds || []).map((m) => m.length));
+  const isDangerPhase = ctx.wallCount < 28 || oppMaxMelds >= 2;
+
   let bestIndex = evalIndices[0];
   let maxTotalScore = -999999999;
-
-  const visibleCounts: Record<string, number> = {};
-  ctx.discards.forEach((t) => {
-    const key = `${t.type}-${t.value}`;
-    visibleCounts[key] = (visibleCounts[key] || 0) + 1;
-  });
-  ctx.meldedTiles.forEach((meld) => {
-    meld.forEach((t) => {
-      const key = `${t.type}-${t.value}`;
-      visibleCounts[key] = (visibleCounts[key] || 0) + 1;
-    });
-  });
-  ctx.oppMelds.forEach((playerMelds) => {
-    playerMelds.forEach((meld) => {
-      meld.forEach((t) => {
-        const key = `${t.type}-${t.value}`;
-        visibleCounts[key] = (visibleCounts[key] || 0) + 1;
-      });
-    });
-  });
-
-  const counts = new Map<string, number>();
-  hand.forEach((c) => {
-    if (ctx.hongzhongMode && isHongzhong(c)) return;
-    counts.set(`${c.type}-${c.value}`, (counts.get(`${c.type}-${c.value}`) || 0) + 1);
-  });
-  let totalPairsInHand = 0;
-  for (const cnt of counts.values()) {
-    if (cnt >= 2) totalPairsInHand++;
-  }
-  const isPursuingSevenPairs = totalPairsInHand >= 4;
 
   for (const i of evalIndices) {
     const tile = hand[i];
     const hand13 = hand.filter((_, idx) => idx !== i);
-    const base13Score = scoreMahjongHand(hand13, ctx, false);
 
-    let effectiveScoreSum = 0;
-    let tingDoors = 0;
-    let tingWinningTilesCount = 0;
+    const uInfo = evaluateHandUkeire(hand13, ctx.hongzhongMode, visibleCounts, meldsCount);
+    const shapeScore = scoreMahjongHand(hand13, ctx, false);
 
-    for (const kind of ALL_TILE_KINDS) {
-      const kindKey = `${kind.type}-${kind.value}`;
-      const usedCount = visibleCounts[kindKey] || 0;
-      const inHand13Count = hand13.filter((t) => t.type === kind.type && t.value === kind.value).length;
-      const availableInWall = Math.max(0, 4 - usedCount - inHand13Count);
-
-      if (availableInWall === 0) continue;
-
-      const testHand14 = [...hand13, { id: 'test', type: kind.type, value: kind.value, text: kind.text }];
-      const canWin = ctx.hongzhongMode ? checkHongzhongWinLocal(testHand14) : checkMahjongWinLocal(testHand14);
-
-      if (canWin) {
-        tingDoors++;
-        tingWinningTilesCount += availableInWall;
-      } else {
-        const connects = hand13.some(
-          (t) => t.type === kind.type && (t.value === kind.value || (t.type !== 'zi' && Math.abs(t.value - kind.value) <= 2))
-        );
-        if (connects) {
-          effectiveScoreSum += 120 * availableInWall;
-        }
-      }
-    }
-
-    let tingBonus = 0;
-    if (tingDoors > 0) {
-      tingBonus = 35000 + tingDoors * 5000 + tingWinningTilesCount * 800;
-    }
+    // Primary: Minimize Shanten (向听数)
+    // Secondary: Maximize effective remaining wall tiles (有效进张 ukeire + 听牌数)
+    const shantenScore = (8 - uInfo.shanten) * 120000;
+    const ukeireScore =
+      uInfo.shanten === 0
+        ? 45000 + uInfo.tingTiles * 3500 + uInfo.tingDoors * 2200
+        : uInfo.ukeire * 1400 + uInfo.advancingDoors * 400;
 
     let discardUrgencyBonus = 0;
     const sameTileCountInHand = hand.filter((t) => t.type === tile.type && t.value === tile.value).length;
-    const sameTileVisible = visibleCounts[`${tile.type}-${tile.value}`] || 0;
-
-    if (isPursuingSevenPairs) {
-      if (sameTileCountInHand >= 2) {
-        discardUrgencyBonus -= 30000;
-      } else {
-        discardUrgencyBonus += 4500;
-      }
-    }
+    const tileKey = `${tile.type}-${tile.value}`;
+    const sameTileVisible = visibleCounts[tileKey] || 0;
 
     if (tile.type === 'zi') {
       if (sameTileCountInHand === 1) {
-        if (sameTileVisible >= 2) {
-          discardUrgencyBonus += 2400;
-        } else {
-          discardUrgencyBonus += 1300;
-        }
+        discardUrgencyBonus += sameTileVisible >= 2 ? 1400 : 850;
       } else if (sameTileCountInHand === 2) {
-        discardUrgencyBonus -= 800;
+        discardUrgencyBonus -= 400;
       }
-    } else {
-      if (sameTileCountInHand === 1) {
-        if (tile.value === 1 || tile.value === 9) {
-          const hasAdjacent = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) === 1);
-          if (!hasAdjacent) {
-            discardUrgencyBonus += 700;
-          }
-        } else if (tile.value === 2 || tile.value === 8) {
-          const hasNeighbor = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) <= 1 && t !== tile);
-          if (!hasNeighbor) {
-            discardUrgencyBonus += 380;
-          }
-        } else {
-          const hasCloseNeighbor = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) <= 2 && t !== tile);
-          if (!hasCloseNeighbor) {
-            discardUrgencyBonus += 220;
-          }
-        }
+    } else if (sameTileCountInHand === 1) {
+      if (tile.value === 1 || tile.value === 9) {
+        const hasAdj = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) === 1);
+        const hasGap = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) === 2);
+        if (!hasAdj && !hasGap) discardUrgencyBonus += 550;
+        else if (!hasAdj) discardUrgencyBonus += 250;
+      } else if (tile.value === 2 || tile.value === 8) {
+        const hasNeighbor = hand.some((t) => t.type === tile.type && Math.abs(t.value - tile.value) <= 1 && t !== tile);
+        if (!hasNeighbor) discardUrgencyBonus += 280;
       }
     }
 
+    // Slight Yi-Wu-Jiu Ma preservation tie-breaker in Hongzhong mode
+    if (ctx.hongzhongMode && isYiWuJiuMaTile(tile) && uInfo.shanten >= 1) {
+      discardUrgencyBonus -= 30;
+    }
+
+    // Defense / Safety awareness in late wall or vs melded opponents
     let defenseBonus = 0;
-    if (ctx.wallCount < 30) {
-      const isAlreadyInDiscards = ctx.discards.some((d) => d.type === tile.type && d.value === tile.value);
-      if (isAlreadyInDiscards) {
-        defenseBonus += 700;
-      } else if (tile.type !== 'zi' && tile.value >= 4 && tile.value <= 6) {
-        defenseBonus -= 450;
+    if (isDangerPhase) {
+      const seenCount = sameTileVisible + sameTileCountInHand;
+      const isGenbutsu = (ctx.discards || []).some((d) => d.type === tile.type && d.value === tile.value);
+      if (isGenbutsu) {
+        defenseBonus += uInfo.shanten >= 2 ? 2400 : 900;
+      } else if (seenCount >= 3) {
+        defenseBonus += uInfo.shanten >= 2 ? 1600 : 600;
+      } else if (tile.type !== 'zi' && tile.value >= 4 && tile.value <= 6 && sameTileVisible === 0) {
+        defenseBonus -= uInfo.shanten >= 2 ? 1800 : 500;
       }
     }
 
-    const totalEvaluation = base13Score + effectiveScoreSum + tingBonus + discardUrgencyBonus + defenseBonus;
+    const totalEvaluation = shantenScore + ukeireScore + shapeScore * 0.25 + discardUrgencyBonus + defenseBonus;
 
     if (totalEvaluation > maxTotalScore) {
       maxTotalScore = totalEvaluation;

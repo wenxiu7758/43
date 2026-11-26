@@ -229,6 +229,8 @@ import {
   shouldSmartPengHand,
   scoreMahjongHand,
   findSmartBestDiscardIdx,
+  shouldSmartKongHand,
+  findSmartSelfKong,
 } from '../../games/mahjong/aiWinEngine';
 
 const props = defineProps<{
@@ -805,8 +807,33 @@ function canRawClaimDiscardedTile(tile: MahjongTile | null | undefined): boolean
   return myHand.value.filter((c) => c.type === tile.type && c.value === tile.value).length >= 2;
 }
 
-function shouldSmartPeng(hand: MahjongTile[], tile: MahjongTile): boolean {
-  return shouldSmartPengHand(hand, tile, isHongzhongMode.value);
+function getMyAiContext() {
+  return {
+    hongzhongMode: isHongzhongMode.value,
+    discards: discards.value,
+    meldedTiles: meldedTiles.value,
+    oppMelds: oppMelds.value,
+    wallCount: wallCount.value,
+  };
+}
+
+function getBotAiContext(botIdx: number) {
+  const otherMelds: MahjongTile[][][] = [meldedTiles.value];
+  for (let b = 0; b < 3; b++) {
+    if (b !== botIdx) otherMelds.push(oppMelds.value[b] || []);
+  }
+  return {
+    hongzhongMode: isHongzhongMode.value,
+    discards: discards.value,
+    meldedTiles: oppMelds.value[botIdx] || [],
+    oppMelds: otherMelds,
+    wallCount: wallPool.length,
+  };
+}
+
+function shouldSmartPeng(hand: MahjongTile[], tile: MahjongTile, botIdx?: number): boolean {
+  const ctx = botIdx !== undefined ? getBotAiContext(botIdx) : getMyAiContext();
+  return shouldSmartPengHand(hand, tile, isHongzhongMode.value, ctx);
 }
 
 function waitForPlayerClaim(next: () => void) {
@@ -821,24 +848,22 @@ function waitForPlayerClaim(next: () => void) {
 
   // 托管状态下的智能截击判定（托管自动明杠或智能碰牌）
   if (isAutoHost.value && !hasWon.value && !isDrawStalemate.value && dealingPhase.value === 'playing') {
-    if (canGang.value) {
+    const d = lastDiscarded.value;
+    if (canGang.value && d && shouldSmartKongHand(myHand.value, d, 'ming', isHongzhongMode.value, getMyAiContext())) {
       claimWaitTimer = setTimeout(() => {
         claimWaitTimer = null;
         if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
         handleGang();
-      }, 500);
+      }, 450);
       return;
     }
-    if (canPeng.value) {
-      const d = lastDiscarded.value;
-      if (d && shouldSmartPeng(myHand.value, d)) {
-        claimWaitTimer = setTimeout(() => {
-          claimWaitTimer = null;
-          if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
-          handlePeng();
-        }, 500);
-        return;
-      }
+    if (canPeng.value && d && shouldSmartPeng(myHand.value, d)) {
+      claimWaitTimer = setTimeout(() => {
+        claimWaitTimer = null;
+        if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
+        handlePeng();
+      }, 450);
+      return;
     }
     claimWaitTimer = setTimeout(() => {
       claimWaitTimer = null;
@@ -848,7 +873,7 @@ function waitForPlayerClaim(next: () => void) {
         return;
       }
       next();
-    }, 550);
+    }, 500);
     return;
   }
 
@@ -910,6 +935,10 @@ function findSmartBestDiscard(hand: MahjongTile[]): number {
   });
 }
 
+function findBotSmartBestDiscard(hand: MahjongTile[], botIdx: number): number {
+  return findSmartBestDiscardIdx(hand, getBotAiContext(botIdx));
+}
+
 function checkAutoHostTurn() {
   stopTurnCountdown();
   if (!isAutoHost.value || turnPlayer.value !== 0 || hasWon.value || isDrawStalemate.value) return;
@@ -923,8 +952,17 @@ function checkAutoHostTurn() {
       return;
     }
     if (canGang.value) {
-      handleGang();
-      return;
+      const myCtx = getMyAiContext();
+      const d = lastDiscarded.value;
+      const isMingCandidate = myHand.value.length % 3 === 1 && d && d.discardBy !== 0;
+      if (isMingCandidate && d && shouldSmartKongHand(myHand.value, d, 'ming', isHongzhongMode.value, myCtx)) {
+        handleGang();
+        return;
+      }
+      if (myHand.value.length % 3 === 2 && findSmartSelfKong(myHand.value, meldedTiles.value, isHongzhongMode.value, myCtx)) {
+        handleGang();
+        return;
+      }
     }
     if (myHand.value.length % 3 === 2) {
       const bestDiscardIdx = findSmartBestDiscard(myHand.value);
@@ -2861,11 +2899,56 @@ function runOpponentTurns() {
   passTurnToNext(0);
 }
 
+function findPracticeBotClaimSeat(fromRelSeat: number): number | null {
+  if (!props.isPracticeMode || !lastDiscarded.value) return null;
+  const d = lastDiscarded.value;
+  if (isHongzhongMode.value && isHongzhong(d)) return null;
+  for (let step = 1; step <= 3; step++) {
+    const candSeat = (fromRelSeat + step) % 4;
+    if (candSeat === 0) continue;
+    const candAbs = relToAbsSeat(candSeat);
+    if (!isSeatBot(candAbs)) continue;
+    const bIdx = candSeat - 1;
+    const botHand = oppHands.value[bIdx] || [];
+    if (botHand.length % 3 !== 1) continue;
+    const matches = botHand.filter((c) => c.type === d.type && c.value === d.value);
+    if (matches.length < 2) continue;
+    const botCtx = getBotAiContext(bIdx);
+    if (matches.length >= 3 && wallPool.length > 0 && shouldSmartKongHand(botHand, d, 'ming', isHongzhongMode.value, botCtx)) {
+      return candSeat;
+    }
+    if (shouldSmartPeng(botHand, d, bIdx)) {
+      return candSeat;
+    }
+  }
+  return null;
+}
+
 function passTurnToNext(fromRelSeat: number) {
   stopTurnCountdown();
   stopClaimCountdown();
   if (botTimer) clearTimeout(botTimer);
   if (hasWon.value || showSettlement.value || isDrawStalemate.value || dealingPhase.value !== 'playing') return;
+
+  // 练习模式：检查场上任意非出牌方机器人是否可以明杠或碰牌截击（不仅限于下家）
+  if (props.isPracticeMode && lastDiscarded.value) {
+    const claimBotSeat = findPracticeBotClaimSeat(fromRelSeat);
+    if (claimBotSeat !== null) {
+      turnPlayer.value = claimBotSeat;
+      startTurnCountdown();
+      drawTable();
+      saveLocalSnapshot();
+      const claimDelay = Math.floor(380 + Math.random() * 260);
+      const t = setTimeout(() => {
+        if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
+        botPlay(claimBotSeat, () => {
+          passTurnToNext(claimBotSeat);
+        });
+      }, claimDelay);
+      botActionTimers.push(t);
+      return;
+    }
+  }
 
   const nextRelSeat = (fromRelSeat + 1) % 4;
   const nextAbsSeat = relToAbsSeat(nextRelSeat);
@@ -2910,6 +2993,7 @@ function botPlay(seat: number, next: () => void) {
   if (hasWon.value || showSettlement.value || isDrawStalemate.value || dealingPhase.value !== 'playing') return;
   const botIdx = seat - 1; // 0=East, 1=North, 2=West
   const botHand = oppHands.value[botIdx] || [];
+  const botCtx = getBotAiContext(botIdx);
 
   // 1. 明杠与碰牌截击判断：检测上一张打出的牌（规则：全场仅限自摸和牌，没有点炮胡）
   if (botHand.length % 3 === 1 && lastDiscarded.value && lastDiscarded.value.discardBy !== seat) {
@@ -2917,8 +3001,8 @@ function botPlay(seat: number, next: () => void) {
     const matches = botHand.filter(c => c.type === d.type && c.value === d.value);
     const canMeld = !(isHongzhongMode.value && isHongzhong(d));
 
-    // ② 明杠 (手牌持 3 张同牌 + 抓到他人打出牌，牌墙有余牌可补才允许杠)
-    if (canMeld && wallPool.length > 0 && matches.length === 3 && Math.random() < 0.95) {
+    // ② 明杠 (手牌持 3 张同牌 + 抓到他人打出牌，牌墙有余牌可补且向听引擎判定合算才杠)
+    if (canMeld && wallPool.length > 0 && matches.length === 3 && shouldSmartKongHand(botHand, d, 'ming', isHongzhongMode.value, botCtx)) {
       const fromSeat = typeof d.discardBy === 'number' ? d.discardBy : -1;
       const takeThree = matches.slice(0, 3);
       const rmIds = new Set(takeThree.map(c => c.id));
@@ -2965,7 +3049,7 @@ function botPlay(seat: number, next: () => void) {
       const t = setTimeout(() => {
         if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
         const updatedHand = oppHands.value[botIdx];
-        const bestDiscardIdx = findSmartBestDiscard(updatedHand);
+        const bestDiscardIdx = findBotSmartBestDiscard(updatedHand, botIdx);
         const [discarded] = updatedHand.splice(bestDiscardIdx, 1);
         discarded.discardBy = seat;
         oppHands.value[botIdx] = sortHand(updatedHand);
@@ -2977,15 +3061,15 @@ function botPlay(seat: number, next: () => void) {
         tipMessage.value = `🀄 【${SEAT_NAMES[seat]}】杠后打出了【${discarded.text}】`;
         drawTable();
         waitForPlayerClaim(() => {
-          next();
+          passTurnToNext(seat);
         });
-      }, 1100);
+      }, 950);
       botActionTimers.push(t);
       return;
     }
 
-    // ③ 碰牌 (手牌持 2 张同牌，依据听牌与牌型理性推理)
-    if (canMeld && matches.length >= 2 && shouldSmartPeng(botHand, d)) {
+    // ③ 碰牌 (手牌持 2 张同牌，依据向听数与有效进张推理)
+    if (canMeld && matches.length >= 2 && shouldSmartPeng(botHand, d, botIdx)) {
       const takeTwo = matches.slice(0, 2);
       const rmIds = new Set(takeTwo.map(c => c.id));
       oppHands.value[botIdx] = botHand.filter(c => !rmIds.has(c.id));
@@ -3008,7 +3092,7 @@ function botPlay(seat: number, next: () => void) {
         if (hasWon.value || showSettlement.value || dealingPhase.value !== 'playing') return;
         pendingPengTurn.value = null;
         const updatedHand = oppHands.value[botIdx];
-        const bestDiscardIdx = findSmartBestDiscard(updatedHand);
+        const bestDiscardIdx = findBotSmartBestDiscard(updatedHand, botIdx);
         const [discarded] = updatedHand.splice(bestDiscardIdx, 1);
         discarded.discardBy = seat;
         oppHands.value[botIdx] = sortHand(updatedHand);
@@ -3022,7 +3106,7 @@ function botPlay(seat: number, next: () => void) {
         waitForPlayerClaim(() => {
           passTurnToNext(seat);
         });
-      }, 1100);
+      }, 950);
       botActionTimers.push(t);
       return;
     }
@@ -3052,20 +3136,14 @@ function botPlay(seat: number, next: () => void) {
     return;
   }
 
-  // Check for AnGang (4 identical tiles in hand, skip Hongzhong in Hongzhong mode)
-  const counts = new Map<string, MahjongTile[]>();
-  botHand.forEach(c => {
-    if (isHongzhongMode.value && isHongzhong(c)) return;
-    const k = `${c.type}-${c.value}`;
-    if (!counts.has(k)) counts.set(k, []);
-    counts.get(k)!.push(c);
-  });
-  let didBotSelfGang = false;
-  if (wallPool.length > 0) {
-    for (const tiles of counts.values()) {
-      if (tiles.length === 4) {
-        const ids = new Set(tiles.map(c => c.id));
-        const remainingHand = botHand.filter(c => !ids.has(c.id));
+  // 智能暗杠 / 补杠判断
+  if (wallPool.length > 0 && botHand.length % 3 === 2) {
+    const selfKong = findSmartSelfKong(botHand, oppMelds.value[botIdx] || [], isHongzhongMode.value, getBotAiContext(botIdx));
+    if (selfKong) {
+      if (selfKong.gangType === 'an') {
+        const tiles = botHand.filter((c) => c.type === selfKong.tile.type && c.value === selfKong.tile.value).slice(0, 4);
+        const ids = new Set(tiles.map((c) => c.id));
+        const remainingHand = botHand.filter((c) => !ids.has(c.id));
         oppMelds.value[botIdx].push(tiles);
         for (let k = 0; k < 4; k++) {
           if (k !== seat) seatKongScores.value[k] -= 10;
@@ -3080,27 +3158,12 @@ function botPlay(seat: number, next: () => void) {
           remainingHand.push(supp);
         }
         oppHands.value[botIdx] = sortHand(remainingHand);
-        didBotSelfGang = true;
-        if (isHongzhongMode.value && oppHands.value[botIdx].filter(isHongzhong).length === 4) {
-          triggerMahjongWin(seat, true);
-          return;
-        }
-        const canGangHu = isHongzhongMode.value ? checkHongzhongWin(oppHands.value[botIdx]) : checkMahjongWin(oppHands.value[botIdx]);
-        if (canGangHu) {
-          triggerMahjongWin(seat, false);
-          return;
-        }
-        break;
-      }
-    }
-  }
-
-  // Check for BuGang (adding a 4th matching tile to an existing 3-tile peng meld)
-  if (!didBotSelfGang && wallPool.length > 0) {
-    for (const meld of oppMelds.value[botIdx] || []) {
-      if (meld.length === 3 && meld[0].type === meld[1].type && meld[0].value === meld[1].value) {
-        const matchIdx = botHand.findIndex((c) => c.type === meld[0].type && c.value === meld[0].value);
-        if (matchIdx !== -1) {
+      } else {
+        const meld = (oppMelds.value[botIdx] || []).find(
+          (m) => m.length === 3 && m[0].type === selfKong.tile.type && m[0].value === selfKong.tile.value
+        );
+        const matchIdx = botHand.findIndex((c) => c.id === selfKong.tile.id || (c.type === selfKong.tile.type && c.value === selfKong.tile.value));
+        if (meld && matchIdx >= 0) {
           const addedTile = botHand.splice(matchIdx, 1)[0];
           meld.push(addedTile);
           for (let k = 0; k < 4; k++) {
@@ -3116,24 +3179,23 @@ function botPlay(seat: number, next: () => void) {
             botHand.push(supp);
           }
           oppHands.value[botIdx] = sortHand(botHand);
-          if (isHongzhongMode.value && oppHands.value[botIdx].filter(isHongzhong).length === 4) {
-            triggerMahjongWin(seat, true);
-            return;
-          }
-          const canGangHu = isHongzhongMode.value ? checkHongzhongWin(oppHands.value[botIdx]) : checkMahjongWin(oppHands.value[botIdx]);
-          if (canGangHu) {
-            triggerMahjongWin(seat, false);
-            return;
-          }
-          break;
         }
+      }
+      if (isHongzhongMode.value && oppHands.value[botIdx].filter(isHongzhong).length === 4) {
+        triggerMahjongWin(seat, true);
+        return;
+      }
+      const canGangHu = isHongzhongMode.value ? checkHongzhongWin(oppHands.value[botIdx]) : checkMahjongWin(oppHands.value[botIdx]);
+      if (canGangHu) {
+        triggerMahjongWin(seat, false);
+        return;
       }
     }
   }
 
-  // 2. Pro-level AI selection using findSmartBestDiscard
+  // 2. Pro-level AI selection using findBotSmartBestDiscard
   const currentBotHand = oppHands.value[botIdx];
-  const bestDiscardIdx = findSmartBestDiscard(currentBotHand);
+  const bestDiscardIdx = findBotSmartBestDiscard(currentBotHand, botIdx);
   const [discarded] = currentBotHand.splice(bestDiscardIdx, 1);
   discarded.discardBy = seat;
   oppHands.value[botIdx] = sortHand(currentBotHand);

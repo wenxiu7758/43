@@ -2,6 +2,14 @@ import type { WebSocket } from 'ws';
 import { generateRoomDeal } from '../../gameDeckService.ts';
 import { checkMahjongWin, computeMahjongSettlement, sortMahjongTiles } from '../../engine/mahjongRules.ts';
 import {
+  findSmartBestDiscardIdx,
+  findSmartSelfKong,
+  normalizeServerMelds,
+  shouldSmartKongHand,
+  shouldSmartPengHand,
+  type MahjongAiContext,
+} from '../../games/mahjong/aiWinEngine.ts';
+import {
   isBotLikePlayer,
   SETTLEMENT_TIMEOUT_MS,
   type RealtimeHubContext,
@@ -218,7 +226,49 @@ export function executeMahjongDrawStalemate(
   }));
 }
 
-export function computeMahjongClaimPendingSeats(room: any, bs: any, discardSeat: number, discTile: any): number[] {
+export function isMahjongSeatAutoManaged(room: any, bs: any, seat: number): boolean {
+  const pl = room.players?.find((x: any) => x.seat === seat);
+  return Boolean(
+    pl?.isAutoManaged ||
+      pl?.isDisconnected ||
+      isBotLikePlayer(pl) ||
+      bs?.autoManagedSeats?.[seat]
+  );
+}
+
+export function buildServerMahjongAiContext(room: any, bs: any, seat: number): MahjongAiContext {
+  const isHongzhongMode = room.sceneMode?.includes('hongzhong') ?? true;
+  const allMeldsRaw = bs?.extraState?.mahjongMelds || [[], [], [], []];
+  const myMelds = normalizeServerMelds(allMeldsRaw[seat] || []);
+  const oppMelds = [0, 1, 2, 3]
+    .filter((s) => s !== seat)
+    .map((s) => normalizeServerMelds(allMeldsRaw[s] || []));
+  const wallCount = Array.isArray((room as any).deal?.remainingWall)
+    ? (room as any).deal.remainingWall.length
+    : Number(bs?.extraState?.wallRemaining ?? 0);
+
+  return {
+    hongzhongMode: isHongzhongMode,
+    discards: Array.isArray(bs?.extraState?.mahjongDiscards) ? bs.extraState.mahjongDiscards : [],
+    meldedTiles: myMelds,
+    oppMelds,
+    wallCount,
+  };
+}
+
+export interface MahjongAutoClaimPlan {
+  seat: number;
+  action: 'gang' | 'peng';
+  executeAt: number;
+}
+
+export function computeMahjongClaimPendingSeats(
+  room: any,
+  bs: any,
+  discardSeat: number,
+  discTile: any,
+  autoClaimsOut?: Record<number, MahjongAutoClaimPlan>
+): number[] {
   if (!discTile) return [];
   const isHongzhongMode = room.sceneMode?.includes('hongzhong') ?? true;
   const isRedDragonTile = (t: any) =>
@@ -228,22 +278,46 @@ export function computeMahjongClaimPendingSeats(room: any, bs: any, discardSeat:
   const seatCardsAll = (room as any).deal?.seatCards;
   if (!seatCardsAll || typeof seatCardsAll !== 'object') return [];
 
+  const now = Date.now();
+  const wallLen = Array.isArray((room as any).deal?.remainingWall)
+    ? (room as any).deal.remainingWall.length
+    : Number(bs?.extraState?.wallRemaining ?? 0);
+
   const pending: number[] = [];
   for (let s = 0; s < 4; s++) {
     if (s === discardSeat) continue;
-    const pl = room.players?.find((x: any) => x.seat === s);
-    const isAuto = Boolean(
-      pl?.isAutoManaged ||
-        pl?.isDisconnected ||
-        isBotLikePlayer(pl) ||
-        bs.autoManagedSeats?.[s]
-    );
-    if (isAuto) continue;
     const hand = seatCardsAll[s];
     if (!Array.isArray(hand)) continue;
     const matchCount = hand.filter((c: any) => c.type === discTile.type && Number(c.value) === Number(discTile.value)).length;
-    if (matchCount >= 2 && hand.length % 3 === 1) {
+    if (matchCount < 2 || hand.length % 3 !== 1) continue;
+
+    const isAuto = isMahjongSeatAutoManaged(room, bs, s);
+    if (!isAuto) {
       pending.push(s);
+      continue;
+    }
+
+    // 托管 / 人机席位：调用高智能向听数引擎判定是否明杠或碰牌
+    const aiCtx = buildServerMahjongAiContext(room, bs, s);
+    let desiredAction: 'gang' | 'peng' | null = null;
+    if (matchCount >= 3 && wallLen > 0 && shouldSmartKongHand(hand, discTile, 'ming', isHongzhongMode, aiCtx)) {
+      desiredAction = 'gang';
+    } else if (shouldSmartPengHand(hand, discTile, isHongzhongMode, aiCtx)) {
+      desiredAction = 'peng';
+    }
+
+    if (desiredAction) {
+      pending.push(s);
+      if (autoClaimsOut) {
+        const pl = room.players?.find((x: any) => x.seat === s);
+        const isConnectedHumanAuto = Boolean(pl && !pl.isDisconnected && !isBotLikePlayer(pl));
+        autoClaimsOut[s] = {
+          seat: s,
+          action: desiredAction,
+          // 已连线的手动托管玩家先给客户端 ~1200ms 同步发起，机器人/掉线玩家 ~350ms 立即接管截击
+          executeAt: now + (isConnectedHumanAuto ? 1200 : 350),
+        };
+      }
     }
   }
   return pending;
@@ -273,6 +347,7 @@ export function handleMahjongGameMove(
     Boolean(t && t.type === 'zi' && (Number(t.value) === 5 || t.text === '红中' || t.isRedDragon));
 
   const sendMahjongReject = (rejectAction: string, reason: string, extra: Record<string, any> = {}) => {
+    if (!ws || typeof ws.send !== 'function') return;
     const seatHand = Array.isArray((room as any).deal?.seatCards?.[seat]) ? [...(room as any).deal.seatCards[seat]] : undefined;
     const rejectEvt = {
       action: rejectAction,
@@ -366,13 +441,17 @@ export function handleMahjongGameMove(
     }
     p.wallRemaining = bs.extraState.wallRemaining;
 
-    const pendingClaimSeats = discTile ? computeMahjongClaimPendingSeats(room, bs, seat, discTile) : [];
+    const autoClaimsMap: Record<number, MahjongAutoClaimPlan> = {};
+    const pendingClaimSeats = discTile
+      ? computeMahjongClaimPendingSeats(room, bs, seat, discTile, autoClaimsMap)
+      : [];
     if (pendingClaimSeats.length > 0) {
       bs.extraState.claimWindow = {
         discardId: discTile.id,
         discarderSeat: seat,
         pendingSeats: pendingClaimSeats,
         passedSeats: [],
+        autoClaims: autoClaimsMap,
         createdAt: Date.now(),
       };
     } else {
@@ -972,7 +1051,98 @@ export function tickMahjongClaimWindow(ctx: RealtimeHubContext, room: any, now: 
   if (room.gameType !== 'mahjong' || !room.boardState?.extraState?.claimWindow) {
     return false;
   }
-  const cw = room.boardState.extraState.claimWindow;
+  const bs = room.boardState;
+  const cw = bs.extraState.claimWindow;
+  const lastDisc = bs.extraState.lastDiscarded;
+  const isHongzhongMode = room.sceneMode?.includes('hongzhong') ?? true;
+
+  // 检查当前等待席位中是否存在机器人、掉线玩家或已开启托管的玩家（含窗口中途切换托管）
+  if (lastDisc && Array.isArray(cw.pendingSeats)) {
+    const passedSet = new Set<number>(cw.passedSeats || []);
+    for (const ps of cw.pendingSeats) {
+      if (passedSet.has(ps)) continue;
+      if (!isMahjongSeatAutoManaged(room, bs, ps)) continue;
+
+      if (!cw.autoClaims) cw.autoClaims = {};
+      let plan: { seat: number; action: 'gang' | 'peng' | 'pass'; executeAt: number } | undefined = cw.autoClaims[ps];
+      if (!plan) {
+        const hand = (room as any).deal?.seatCards?.[ps];
+        const wallLen = Array.isArray((room as any).deal?.remainingWall)
+          ? (room as any).deal.remainingWall.length
+          : Number(bs.extraState?.wallRemaining ?? 0);
+        const matchCount = Array.isArray(hand)
+          ? hand.filter((c: any) => c.type === lastDisc.type && Number(c.value) === Number(lastDisc.value)).length
+          : 0;
+        const aiCtx = buildServerMahjongAiContext(room, bs, ps);
+        let decided: 'gang' | 'peng' | 'pass' = 'pass';
+        if (matchCount >= 3 && wallLen > 0 && shouldSmartKongHand(hand, lastDisc, 'ming', isHongzhongMode, aiCtx)) {
+          decided = 'gang';
+        } else if (matchCount >= 2 && shouldSmartPengHand(hand, lastDisc, isHongzhongMode, aiCtx)) {
+          decided = 'peng';
+        }
+        const pl = room.players?.find((x: any) => x.seat === ps);
+        const isConnectedHumanAuto = Boolean(pl && !pl.isDisconnected && !isBotLikePlayer(pl));
+        plan = {
+          seat: ps,
+          action: decided,
+          executeAt: now + (decided === 'pass' ? 150 : isConnectedHumanAuto ? 1000 : 250),
+        };
+        cw.autoClaims[ps] = plan;
+      }
+
+      if (now >= plan.executeAt) {
+        if (plan.action === 'gang') {
+          handleMahjongGameMove(
+            ctx,
+            null as any,
+            room,
+            ps,
+            'gang',
+            null,
+            {
+              tile: lastDisc,
+              targetDiscardId: lastDisc.id,
+              isMingGang: true,
+              gangType: 'ming',
+              fromSeat: lastDisc.discardBy,
+              absSeat: ps,
+            },
+            { action: 'gang', tile: lastDisc, isMingGang: true, gangType: 'ming' }
+          );
+          return true;
+        }
+        if (plan.action === 'peng') {
+          handleMahjongGameMove(
+            ctx,
+            null as any,
+            room,
+            ps,
+            'peng',
+            null,
+            {
+              tile: lastDisc,
+              targetDiscardId: lastDisc.id,
+              absSeat: ps,
+            },
+            { action: 'peng', tile: lastDisc }
+          );
+          return true;
+        }
+        handleMahjongGameMove(
+          ctx,
+          null as any,
+          room,
+          ps,
+          'pass',
+          null,
+          { discardId: cw.discardId, absSeat: ps },
+          { action: 'pass', discardId: cw.discardId }
+        );
+        return true;
+      }
+    }
+  }
+
   if (now - cw.createdAt > 12500) {
     const nextTurnSeat = (cw.discarderSeat + 1) % 4;
     const resolvedDiscardId = cw.discardId;
@@ -1068,46 +1238,55 @@ export function tickMahjongAutoTurn(ctx: RealtimeHubContext, room: any, currentS
     });
   }
 
-  const redDragonCount = isHongzhongMode
-    ? hand.filter((t: any) => t.type === 'zi' && (t.value === 5 || t.text === '红中' || t.isRedDragon)).length
-    : 0;
-  const isFourHz = isHongzhongMode && redDragonCount >= 4;
-  const winRes =
-    hand.length % 3 === 2 && hand.length + melds.length * 3 === 14
-      ? checkMahjongWin(hand as any, isHongzhongMode)
-      : { win: false, desc: '', fan: 0 };
+  const checkCanSeatHu = () => {
+    const redDragonCount = isHongzhongMode
+      ? hand.filter((t: any) => t.type === 'zi' && (t.value === 5 || t.text === '红中' || t.isRedDragon)).length
+      : 0;
+    const isFourHz = isHongzhongMode && redDragonCount >= 4;
+    const winRes =
+      hand.length % 3 === 2 && hand.length + (room.boardState.extraState?.mahjongMelds?.[currentSeat]?.length || 0) * 3 === 14
+        ? checkMahjongWin(hand as any, isHongzhongMode)
+        : { win: false, desc: '', fan: 0 };
+    if (hand.length % 3 === 2 && (isFourHz || winRes.win)) {
+      executeMahjongWinSettlement(ctx, room, currentSeat, isFourHz, justDrawnTile ? { tile: justDrawnTile } : {});
+      return true;
+    }
+    return false;
+  };
 
-  if (hand.length % 3 === 2 && hand.length + melds.length * 3 === 14 && (isFourHz || winRes.win)) {
-    executeMahjongWinSettlement(ctx, room, currentSeat, isFourHz, justDrawnTile ? { tile: justDrawnTile } : {});
-    return;
-  }
+  if (checkCanSeatHu()) return;
 
-  let discardIdx = 0;
-  const nonHzTiles = isHongzhongMode
-    ? hand
-        .map((t, idx) => ({ t, idx }))
-        .filter((item) => !(item.t.type === 'zi' && (item.t.value === 5 || item.t.text === '红中' || item.t.isRedDragon)))
-    : hand.map((t, idx) => ({ t, idx }));
-
-  if (nonHzTiles.length > 0) {
-    const ziSingles = nonHzTiles.filter((item) => {
-      if (item.t.type !== 'zi') return false;
-      return hand.filter((x) => x.type === 'zi' && x.value === item.t.value).length === 1;
-    });
-    if (ziSingles.length > 0) {
-      discardIdx = ziSingles[0].idx;
-    } else {
-      const isolatedNum = nonHzTiles.filter((item) => {
-        if (item.t.type === 'zi') return false;
-        const hasSame = hand.filter((x) => x.type === item.t.type && x.value === item.t.value).length > 1;
-        const hasNeighbour = hand.some(
-          (x) => x.type === item.t.type && Math.abs(x.value - item.t.value) <= 2 && x.id !== item.t.id
-        );
-        return !hasSame && !hasNeighbour;
-      });
-      discardIdx = isolatedNum.length > 0 ? isolatedNum[0].idx : nonHzTiles[nonHzTiles.length - 1].idx;
+  // 智能暗杠 / 补杠判断
+  if (hand.length % 3 === 2 && wall.length > 0) {
+    const aiCtxBeforeKong = buildServerMahjongAiContext(room, room.boardState, currentSeat);
+    const selfKong = findSmartSelfKong(hand, room.boardState.extraState?.mahjongMelds?.[currentSeat] || [], isHongzhongMode, aiCtxBeforeKong);
+    if (selfKong) {
+      handleMahjongGameMove(
+        ctx,
+        null as any,
+        room,
+        currentSeat,
+        'gang',
+        null,
+        {
+          absSeat: currentSeat,
+          tile: selfKong.tile,
+          gangType: selfKong.gangType,
+        },
+        { action: 'gang', tile: selfKong.tile, gangType: selfKong.gangType }
+      );
+      if (room.status === 'finished' || room.boardState.phase === 'ended') return;
+      justDrawnTile = room.boardState.extraState?.lastDrawnTile || justDrawnTile;
+      if (checkCanSeatHu()) return;
+      // 杠后等待下一轮心跳推进弃牌，便于客户端播放杠后补张表现
+      room.lastTurnTs = now;
+      return;
     }
   }
+
+  // 智能向听数 + 有效进张弃牌
+  const aiCtx = buildServerMahjongAiContext(room, room.boardState, currentSeat);
+  const discardIdx = findSmartBestDiscardIdx(hand, aiCtx);
 
   const [discardedTile] = hand.splice(discardIdx >= 0 && discardIdx < hand.length ? discardIdx : Math.max(0, hand.length - 1), 1);
   const nextSeat = (currentSeat + 1) % 4;
@@ -1130,13 +1309,15 @@ export function tickMahjongAutoTurn(ctx: RealtimeHubContext, room: any, currentS
   room.boardState.extraState.lastDrawnTile = null;
   room.boardState.extraState.wallRemaining = wall.length;
 
-  const pendingClaimSeats = computeMahjongClaimPendingSeats(room, room.boardState, currentSeat, discTile);
+  const autoClaimsMap: Record<number, MahjongAutoClaimPlan> = {};
+  const pendingClaimSeats = computeMahjongClaimPendingSeats(room, room.boardState, currentSeat, discTile, autoClaimsMap);
   if (pendingClaimSeats.length > 0) {
     room.boardState.extraState.claimWindow = {
       discardId: discTile.id,
       discarderSeat: currentSeat,
       pendingSeats: pendingClaimSeats,
       passedSeats: [],
+      autoClaims: autoClaimsMap,
       createdAt: now,
     };
   } else {

@@ -5,6 +5,7 @@ import {
   getYansanSmartAIPlay,
   getYansanRankWeight,
   isYansanComboDeductivelyUnbeatable,
+  shouldYansanAIQiangGong,
   calculateYansanSettlement,
   calculateYansanSurrenderSettlement,
   detectYansanSpecialHolders,
@@ -517,6 +518,27 @@ export function tickYansanAutoTurn(ctx: RealtimeHubContext, room: any, currentSe
   if (!bs.extraState.playHistory) bs.extraState.playHistory = [];
   if (!bs.extraState.hasPassedSeats) bs.extraState.hasPassedSeats = [false, false, false, false];
 
+  const holdsSpade3 = seatHand.some((c) => c.rank === 3 && (c.suit === '♠' || c.suitVal === 4));
+  const holdsSpadeA = seatHand.some((c) => c.rank === 14 && (c.suit === '♠' || c.suitVal === 4));
+  if (
+    !bs.extraState.isQiangGongActive &&
+    !bs.extraState.hasPassedSeats[currentSeat] &&
+    seatHand.length === 13 &&
+    holdsSpade3 &&
+    holdsSpadeA &&
+    shouldYansanAIQiangGong(seatHand)
+  ) {
+    handleYansanGameMove(ctx, room, currentSeat, 'qianggong', null, { action: 'qianggong', seat: currentSeat }, null);
+    return;
+  }
+
+  let nextSeat = (currentSeat - 1 + totalSeats) % totalSeats;
+  let stepGuard = 0;
+  while (finished.includes(nextSeat) && stepGuard < totalSeats) {
+    nextSeat = (nextSeat - 1 + totalSeats) % totalSeats;
+    stepGuard++;
+  }
+
   const isAbsoluteFirst = (bs.extraState.playedCardsHistory || []).length === 0;
   const targetCombo = bs.lastCombo && bs.lastCombo.seat !== currentSeat ? bs.lastCombo : null;
   const aiRes = getYansanSmartAIPlay(seatHand, targetCombo, {
@@ -527,14 +549,9 @@ export function tickYansanAutoTurn(ctx: RealtimeHubContext, room: any, currentSe
     playHistory: bs.extraState.playHistory,
     isQiangGong: Boolean(bs.extraState.isQiangGongActive),
     qiangGongSeat: bs.extraState.qiangGongSeat ?? null,
+    downstreamSeat: nextSeat,
+    lastTargetSeat: targetCombo ? targetCombo.seat : undefined,
   });
-
-  let nextSeat = (currentSeat - 1 + totalSeats) % totalSeats;
-  let stepGuard = 0;
-  while (finished.includes(nextSeat) && stepGuard < totalSeats) {
-    nextSeat = (nextSeat - 1 + totalSeats) % totalSeats;
-    stepGuard++;
-  }
 
   const parsedAiCombo = aiRes.cards && aiRes.cards.length > 0 ? parseYansanCombo(aiRes.cards) : null;
   const canPlayAi = Boolean(parsedAiCombo && (!targetCombo || canBeatYansanCombo(parsedAiCombo, targetCombo)));
