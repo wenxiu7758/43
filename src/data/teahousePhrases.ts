@@ -24,13 +24,6 @@ export const QUICK_PHRASES = [
   '哈哈，这把神仙也救不了你！',
 ];
 
-export const QUICK_VOICE_CHIPS = [
-  { icon: '⚡', label: '催牌', text: '快点吧，我等得花儿都谢了！' },
-  { icon: '👏', label: '赞牌', text: '妙啊！这手牌打得当真出神入化！' },
-  { icon: '🔥', label: '叫阵', text: '诸位看招，这把谁也别想轻易脱身！' },
-  { icon: '🍵', label: '承让', text: '承让承让，这把小弟先拔头筹！' },
-];
-
 export const PHRASE_CATEGORIES: PhraseCategory[] = [
   {
     name: '催牌急招',

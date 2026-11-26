@@ -513,41 +513,6 @@
           />
         </div>
 
-        <!-- Mini Teahouse Quick Voice Bar on Arena Table (Bottom-Right) -->
-        <div class="hidden sm:flex items-center gap-2 p-1.5 rounded-2xl bg-black/75 border border-amber-900/50 backdrop-blur-md absolute bottom-2 right-2 z-30 shadow-[0_4px_16px_rgba(0,0,0,0.8)]">
-          <!-- 4 Quick Dialogue Voice Chips -->
-          <div class="flex items-center gap-1">
-            <button
-              v-for="chip in QUICK_VOICE_CHIPS"
-              :key="chip.label"
-              type="button"
-              @click="sendQuickPhrase(chip.text)"
-              class="px-2 py-1 rounded-lg bg-[#2A1B12]/80 hover:bg-amber-900/60 border border-amber-500/30 hover:border-amber-400/70 text-[11px] font-serif text-amber-200 transition-all active:scale-95 flex items-center gap-1 shadow-xs cursor-pointer"
-              :title="`立即语音播报：${chip.text}`"
-            >
-              <span>{{ chip.icon }}</span>
-              <span>{{ chip.label }}</span>
-            </button>
-          </div>
-          <!-- Quick Dialogue Input + Broadcast -->
-          <form @submit.prevent="sendQuickBarChat" class="flex items-center gap-1.5 pl-1.5 border-l border-amber-900/40">
-            <input
-              v-model="quickBarInput"
-              type="text"
-              maxlength="24"
-              placeholder="输入台词语音飞屏..."
-              class="w-28 sm:w-36 px-2 py-1 text-[11px] rounded-lg bg-black/60 border border-amber-900/50 text-[#F5EFE6] placeholder-stone-500 focus:outline-none focus:border-amber-400"
-            />
-            <button
-              type="submit"
-              class="px-2.5 py-1 rounded-lg bg-gradient-to-r from-amber-600 to-amber-700 hover:from-amber-500 hover:to-amber-600 text-white font-bold text-[11px] whitespace-nowrap shadow-xs active:scale-95 transition-all flex items-center gap-1 cursor-pointer"
-            >
-              <span>📢</span>
-              <span>飞屏</span>
-            </button>
-          </form>
-        </div>
-
         <!-- Redesigned Classical Teahouse Dialogue Drawer (Voice Catchphrases & Danmaku Only) -->
         <div
           v-if="showChatDrawer"
@@ -1040,7 +1005,6 @@ import TeahouseChatroom from './components/TeahouseChatroom.vue';
 import GameRulesModal from './components/GameRulesModal.vue';
 import {
   QUICK_PHRASES,
-  QUICK_VOICE_CHIPS,
   PHRASE_CATEGORIES,
   type VoicedHistoryItem,
 } from './data/teahousePhrases';
@@ -1394,7 +1358,6 @@ const currentSceneBaseStake = computed(() => {
 // Danmaku and Teahouse Dialogue State
 const danmakuEnabled = ref(false);
 const danmakuItems = reactive<{ id: string; sender: string; avatar: string; text: string; prop?: string; color: string; top: number; duration: number }[]>([]);
-const quickBarInput = ref('');
 
 // Category tabs for compact lobby
 const activeCategoryTab = ref<'all' | 'racing' | 'strategy'>('all');
@@ -3145,13 +3108,6 @@ function sendCustomVoicePhrase() {
   if (!text) return;
   sendQuickPhrase(text);
   customVoiceInput.value = '';
-}
-
-function sendQuickBarChat() {
-  const text = quickBarInput.value.trim();
-  if (!text) return;
-  sendQuickPhrase(text);
-  quickBarInput.value = '';
 }
 
 function sendQuickPhrase(phrase: string) {
